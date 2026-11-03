@@ -1,3 +1,6 @@
+import { prepareSchematicPage } from "./schematicPages.js";
+import { prepareBlockTransfer } from "./schematicBlockTransfer.js";
+import { preparePinNets, executePinNets } from "./schematicPinNets.js";
 import { apiError, ensureApi, isNumber, isRecord, numeric, optionalCall, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
@@ -74,6 +77,20 @@ export async function prepareSchematicComponentMutation(
   }
 
   const action = String(params.action ?? "").toLowerCase();
+
+  // Compatibility transport for clients whose running MCP catalog predates page tools.
+  if (action === "update" && params.component === "@schematic") {
+    const properties = params.properties;
+    if (!isRecord(properties) || Object.keys(properties).length !== 1)
+      throw apiError("invalid_params", "@schematic accepts exactly one page or transfer object.");
+    if (isRecord(properties.page)) return prepareSchematicPage(api, { ...properties.page, target: currentTarget });
+    if (isRecord(properties.transfer))
+      return prepareBlockTransfer(api, { ...properties.transfer, target: currentTarget });
+    throw apiError("invalid_params", "@schematic requires page or transfer properties.");
+  }
+  if (action === "update" && isRecord(params.properties) && params.properties.pinNets !== undefined) {
+    return preparePinNets(api, params, currentTarget);
+  }
 
   if (action === "create") {
     if (!params.device) {
@@ -366,6 +383,8 @@ export async function executeSchematicComponentMutation(
 ): Promise<{ executed: boolean; readback: Record<string, unknown> }> {
   const eda = api();
   const op = record.operation as Record<string, any>;
+
+  if (op.action === "assignPinNets") return executePinNets(record, api);
 
   if (op.action === "createComponent") {
     ensureApi("sch_PrimitiveComponent", "create", eda);

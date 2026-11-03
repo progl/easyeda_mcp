@@ -298,6 +298,7 @@ describe("Schematic Wire & Net Label Mutations", () => {
 
     it("executes addNetLabel and verifies readback", async () => {
       const api = () => ({
+        sys_Environment: { getEditorCurrentVersion: () => "4.1.60" },
         dmt_SelectControl: {
           getCurrentDocumentInfo: vi.fn(async () => ({
             uuid: "sch-doc-1",
@@ -406,4 +407,29 @@ describe("native wire rename readback", () => {
       expect(modify).toHaveBeenCalledTimes(1);
     }
   );
+});
+
+describe("EasyEDA 3.x net label compatibility", () => {
+  it("never invokes the v4-only label method on a legacy runtime", async () => {
+    const createNetLabel = vi.fn(async () => undefined);
+    const api = () => ({
+      sys_Environment: { getEditorCurrentVersion: vi.fn(() => "3.2.209") },
+      sch_PrimitiveAttribute: { createNetLabel }
+    });
+    await expect(
+      executeSchematicWireMutation(
+        {
+          operation: {
+            action: "addNetLabel",
+            kind: "label",
+            net: "CLK",
+            x: 1,
+            y: 2
+          }
+        } as any,
+        api
+      )
+    ).rejects.toThrow(/4|unsupported|unavailable/i);
+    expect(createNetLabel).not.toHaveBeenCalled();
+  });
 });

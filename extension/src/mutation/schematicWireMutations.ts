@@ -496,6 +496,28 @@ export async function executeSchematicWireMutation(
   }
 
   if (op.action === "addNetLabel") {
+    if (op.kind !== "flag") {
+      // Some v3 runtimes expose the v4 proxy, but never settle its write promise.
+      // Fail before the write; an execution timeout cannot safely cancel it.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const version = await Promise.race([
+        Promise.resolve()
+          .then(() => eda.sys_Environment?.getEditorCurrentVersion?.())
+          .catch(() => undefined),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 1000);
+        })
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+      const major = Number(String(version ?? "").match(/(?:^|v)(\d+)\./)?.[1]);
+      if (!Number.isFinite(major) || major < 4) {
+        throw apiError(
+          "capability_unavailable",
+          "Independent net labels require a confirmed EasyEDA v4 runtime. Use named wires or net flags on v3."
+        );
+      }
+    }
     let createdItem: unknown;
 
     if (op.kind === "flag" && eda.sch_PrimitiveComponent?.createNetFlag) {

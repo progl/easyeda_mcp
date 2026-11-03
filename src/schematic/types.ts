@@ -82,7 +82,7 @@ export type SchematicNet = {
 export type SchematicSnapshot = {
   nativeNetlist?: {
     status: NativeNetlistData["status"];
-    format: "Protel2";
+    format: "Protel2" | "EasyEDA";
     matchedPins: number;
     conflicts: number;
     reason?: string;

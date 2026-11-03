@@ -1,6 +1,6 @@
 # Tools Reference
 
-EasyEDA Pro MCP exposes **76 tools** across 9 categories. All inspection, tracing, navigation, and export tools are read-only (`readOnlyHint: true`).
+EasyEDA Pro MCP exposes **80 tools** across 9 categories. All inspection, tracing, navigation, and export tools are read-only (`readOnlyHint: true`).
 
 ## Tool Catalog
 
@@ -149,6 +149,17 @@ Prepares a typed schematic component mutation (`create`, `move`, `update`, `dele
 - **`timeoutMs`** (`number`, _optional_, default: `30000`): RPC timeout in ms.
 
 ---
+
+Extension 0.5.2 also accepts `action: "update"` with
+`properties: {"pinNets": {"1": "VCC", "2": "GND"}, "wireStubLength": 2}`.
+This prepares `assignPinNets` for one active-sheet component (1–100 pins).
+Stub length is in native schematic coordinate units, defaults to 10, and must be
+above zero and at most 100. Do not combine it with other property updates.
+The preview checks physical pins and existing wire intersections; execution
+rejects changed geometry, preserves correct connections, and verifies readback.
+Existing conflicting connections require explicit repair. A partial failure must
+be inspected before retrying; the batch is not atomic and is never replayed.
+Independent net labels require a confirmed v4 runtime; use named wires on v3.
 
 ### `easyeda_prepare_schematic_wire`
 
@@ -1399,3 +1410,23 @@ are conservatively treated as pending writes until the entire executor settles.
 ```
 
 :::
+
+## Schematic pages and block transfer (extension 0.5.4)
+
+- `easyeda_list_schematic_pages({includeCounts?: boolean, target?, timeoutMs?})`: pages of the active schematic; optional part/wire counts, drawing format and component-anchor bounds. Counting temporarily opens pages and restores the original focus. The 150-part threshold is advisory.
+- `easyeda_prepare_schematic_page({action: "create"|"rename"|"format", pageId?, name?, format?: "A0"|"A1"|"A2"|"A3"|"A4", target?, timeoutMs?})`: exact prepared confirmation is required through `easyeda_confirmed_action`. Format changes drawing-frame properties; no page deletion is exposed. Save separately.
+- `easyeda_prepare_schematic_block_transfer({components: string[], destinationPageId: string, dx?: number, dy?: number, target?, timeoutMs?})`: 1–100 distinct component IDs/designators, offsets default to zero in native schematic units (10 mil). Transfers complete named wires physically attached to the selected parts, preserves unique IDs, part properties, footprint/symbol identity and attached attribute positions/styles. Rejects wires shared with unselected physical pins, unnamed wires, duplicate destination identities, destination pin/wire intersections and unsupported free labels/text/buses. Split large blocks into smaller operations to stay within execution timeouts.
+- `easyeda_audit_schematic_connectivity({target?, timeoutMs?})`: native membership for each page, namespaced local IDs, unknown pins and confirmed interpage nets. Temporarily opens pages and restores focus. Does not infer disconnection from absent netlist membership.
+
+All four tools belong to the active schematic/project. Reads that activate pages are marked as affecting editor focus. Prepare tools do not write. Confirmed transfer is **not atomic**: it verifies copies before removing originals; failures include a journal and require inspection of both pages. Do not replay an unknown result. Custom library bindings or footprints that the SDK cannot reproduce cause readback failure and preserve source parts; copied parts may remain for inspection. Saving and final ERC/PCB verification remain separate.
+
+Compatibility with a running MCP catalog older than these tools: use
+`easyeda_prepare_schematic_component({action:"update",component:"@schematic",properties:{page:{action:"create",name:"pH"}}})`
+or `properties:{transfer:{components:["R1"],destinationPageId:"...",dx:0,dy:0}}`.
+Exactly one `page` or `transfer` object is permitted. The same preview, target checks and confirmation lifecycle apply. Restart the MCP server to expose the four dedicated tool names.
+
+Native connectivity first validates Protel2, then falls back to documented EasyEDA `.enet` JSON (`components` / `props.Designator` / `pinInfoMap`). Unsupported exports remain explicitly unknown. Multi-page snapshots namespace primitive IDs and omit page-local wire geometry so identical coordinates on different sheets cannot create false connections. Use a single-page snapshot to inspect actual wires and annotations.
+
+SDK references: [page management](https://prodocs.easyeda.com/en/api/reference/pro-api.dmt_schematic.html), [native JSON netlist specification](https://github.com/easyeda/easyeda-netlist-format/blob/main/easyeda-pro-netlist-format-en.md).
+
+In 0.5.4, project-local 16-character device IDs are resolved to an exact global library part by supplier ID, manufacturer part and footprint name before writes. Unresolvable parts are rejected. Page-name readback accepts the canonical lowercase names returned by EasyEDA.

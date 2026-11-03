@@ -1,3 +1,4 @@
+import { collectSchematicMembership } from "./schematicConnectivity.js";
 import { collectNativeNetlist } from "./nativeNetlist.js";
 import {
   assertSnapshotFresh,
@@ -43,6 +44,24 @@ export async function collectSchematicSnapshot(
     assertDocumentTargetMatch(options.expectedTarget, target);
   }
 
+  if (options.allPages && eda.dmt_Schematic?.getCurrentSchematicAllSchematicPagesInfo) {
+    const data = await collectSchematicMembership(api, { target });
+    const snapshot = buildSchematicSnapshot({
+      target,
+      source: "native_api",
+      capturedAt: target.capturedAt,
+      components: data.components,
+      pinsByComponent: data.pinsByComponent,
+      wires: [],
+      texts: [],
+      includeRaw: options.includeRaw,
+      nativeNetlist: data.native
+    });
+    snapshot.warnings.push(
+      "Multi-page geometry is intentionally omitted: page-local coordinates must not be electrically merged. Use single-page snapshots for wires and annotations."
+    );
+    return snapshot;
+  }
   ensureApi("sch_PrimitiveComponent", "getAll", eda);
   const components = toArray(await eda.sch_PrimitiveComponent.getAll(undefined, options.allPages));
   const pinsByComponent: Record<string, unknown[]> = {};

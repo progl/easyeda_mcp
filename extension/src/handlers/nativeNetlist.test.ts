@@ -20,11 +20,11 @@ describe("native netlist collection", () => {
     expect(getNetlistFile).toHaveBeenCalledWith("mcp-native-connectivity", "Protel2");
     expect(result).toMatchObject({ status: "available", ambiguousDesignators: ["U1"] });
   });
-  it("does not claim support when the API or page scope is unavailable", async () => {
+  it("does not claim support when the API or returned File is unavailable", async () => {
     expect((await collectNativeNetlist({}, false)).status).toBe("unavailable");
     const getNetlistFile = vi.fn();
-    expect((await collectNativeNetlist({ sch_ManufactureData: { getNetlistFile } }, true)).status).toBe("unavailable");
-    expect(getNetlistFile).not.toHaveBeenCalled();
+    expect((await collectNativeNetlist({ sch_ManufactureData: { getNetlistFile } }, true)).status).toBe("error");
+    expect(getNetlistFile).toHaveBeenCalled();
   });
   it("reports a read failure without changing the editor", async () => {
     const result = await collectNativeNetlist(

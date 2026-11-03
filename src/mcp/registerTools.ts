@@ -1,3 +1,4 @@
+import { registerSchematicPageTools } from "./tools/schematicPageTools.js";
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { EditorClient } from "../editor/EditorClient.js";
 import { registerStatusTools } from "./tools/statusTools.js";
@@ -20,6 +21,7 @@ export function registerEasyEdaTools(server: McpServer, bridge: EditorClient): v
   registerDrcTools(server, bridge);
   registerExportTools(server, bridge);
   registerDocumentTools(server, bridge);
+  registerSchematicPageTools(server, bridge);
   registerSchematicMutationTools(server, bridge);
   registerActionTools(server, bridge);
   registerSpiceTools(server, bridge);

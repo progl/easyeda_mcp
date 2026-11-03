@@ -1,3 +1,6 @@
+import { listSchematicPages, prepareSchematicPage } from "./mutation/schematicPages.js";
+import { prepareBlockTransfer } from "./mutation/schematicBlockTransfer.js";
+import { auditSchematicConnectivity } from "./handlers/schematicConnectivity.js";
 declare const eda: EasyEdaApi;
 
 import { getBridgeConfig, getBridgeUri } from "./bridgeConfig.js";
@@ -45,6 +48,10 @@ let bridgeConnection: BridgeConnection;
 const contextHandlers = createContextHandlers(getApi, () => bridgeConnection.getStatus());
 
 const handlers: Record<string, RpcHandler> = {
+  listSchematicPages: (params) => listSchematicPages(getApi, params),
+  prepareSchematicPage: (params) => prepareSchematicPage(getApi, params),
+  prepareSchematicBlockTransfer: (params) => prepareBlockTransfer(getApi, params),
+  auditSchematicConnectivity: (params) => auditSchematicConnectivity(getApi, params),
   getDrcRules: (params) => drcRules.read(params),
   prepareDrcEdit: (params) => drcRules.prepare(params),
   getDrcEditResult: (params) => drcRules.result(params),

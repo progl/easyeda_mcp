@@ -1,3 +1,5 @@
+import { executeSchematicPage } from "../mutation/schematicPages.js";
+import { executeBlockTransfer } from "../mutation/schematicBlockTransfer.js";
 import type { DrcRules } from "../drcRules.js";
 import { apiError, ensureApi, optionalCall, pickString } from "../helpers.js";
 import { extractDocumentIdentity } from "../identity.js";
@@ -42,7 +44,11 @@ export function createActionHandlers(
         let resultReadback: Record<string, unknown> = {};
         executeFn = async () => {
           let res: { executed: boolean; readback: Record<string, unknown> };
-          if (["createWire", "modifyWire", "deleteWire", "addNetLabel"].includes(record.action)) {
+          if (record.action === "schematicPage") {
+            res = await executeSchematicPage(record, api);
+          } else if (record.action === "transferBlock") {
+            res = await executeBlockTransfer(record, api);
+          } else if (["createWire", "modifyWire", "deleteWire", "addNetLabel"].includes(record.action)) {
             res = await executeSchematicWireMutation(record, api);
           } else if (["createPort", "modifyPort", "deletePort"].includes(record.action)) {
             res = await executeSchematicPortMutation(record, api);
@@ -131,14 +137,12 @@ export function createActionHandlers(
     const documentUuid = pickString(documentInfo, ["uuid", "documentUuid", "id"]);
 
     if (action === "save") {
-      if (eda.pcb_Document?.save) {
-        await eda.pcb_Document.save(documentUuid);
-        return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
-      }
-      if (eda.sch_Document?.save) {
-        await eda.sch_Document.save(documentUuid);
-        return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
-      }
+      const type = extractDocumentIdentity(documentInfo).documentType;
+      const documentApi = type === "schematic" ? eda.sch_Document : type === "pcb" ? eda.pcb_Document : undefined;
+      if (!documentApi?.save) throw apiError("capability_unavailable", `Save API is unavailable for ${type}.`);
+      const result = await documentApi.save(documentUuid);
+      if (result === false) throw apiError("save_failed", "Native document save returned false.");
+      return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
     }
 
     if (action === "importChanges") {
