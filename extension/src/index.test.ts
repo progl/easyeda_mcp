@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type WebSocketRegistration = {
@@ -123,11 +124,7 @@ describe("EasyEDA extension bridge handlers", () => {
         }))
       },
       pcb_Drc: {
-        check: vi.fn(async (_strict: boolean) => ({
-          passed: true,
-          errors: [],
-          warnings: []
-        }))
+        check: vi.fn(async (_strict: boolean, _ui: boolean, verbose: boolean) => (verbose ? [] : true))
       },
       pcb_Layer: {
         getAllLayers: vi.fn(async () => [
@@ -208,6 +205,20 @@ describe("EasyEDA extension bridge handlers", () => {
     vi.resetModules();
   });
 
+  it("enables the official startup event and auto-connects on lazy entry evaluation without activate", async () => {
+    const manifest = JSON.parse(readFileSync(new URL("../extension.json", import.meta.url), "utf8"));
+    expect(manifest.activationEvents.onStartupFinished).toBe(true);
+    const extension = await import("./index.js");
+    await Promise.resolve();
+    expect(registration.onOpen).toBeTypeOf("function");
+    const sdk = (globalThis as any).eda.sys_WebSocket;
+    extension.activate("onStartupFinished");
+    expect(sdk.register).toHaveBeenCalledTimes(1);
+    await registration.onOpen?.();
+    expect(JSON.parse(sentMessages[0].message).kind).toBe("hello");
+    expect(dialogMessages).toEqual([]);
+    extension.deactivate();
+  });
   it("auto-connects on activation and sends hello on open", async () => {
     const extension = await import("./index.js");
 
@@ -317,6 +328,7 @@ describe("EasyEDA extension bridge handlers", () => {
         requestId: "verify-1",
         method: "verifyConnections",
         params: {
+          allPages: false,
           checks: [
             {
               id: "u5-vcc",
@@ -482,7 +494,7 @@ describe("EasyEDA extension bridge handlers", () => {
     });
   });
 
-  it("analyzes PCB routing status and calculates completion percent", async () => {
+  it("reports PCB routing metrics without claiming unproven completion", async () => {
     const extension = await import("./index.js");
     extension.connect();
 
@@ -499,11 +511,13 @@ describe("EasyEDA extension bridge handlers", () => {
     expect(resultMessage.kind).toBe("result");
     expect(resultMessage.result).toMatchObject({
       totalNets: 4,
-      routedNets: 2,
-      unroutedNets: 2,
-      completionPercent: 50
+      routedNets: null,
+      unroutedNets: null,
+      completionPercent: null,
+      status: "inconclusive",
+      verified: false
     });
-    expect(resultMessage.result.unroutedNetNames).toEqual(["SDA", "SCL"]);
+    expect(resultMessage.result.unroutedNetNames).toBeNull();
     expect(resultMessage.result.netLengths).toMatchObject({
       GND: 150.5,
       VCC_3V3: 80.2,

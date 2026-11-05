@@ -1,8 +1,23 @@
 import * as z from "zod/v4";
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { EditorClient } from "../../editor/EditorClient.js";
-import { DefaultTimeoutSchema, DocumentTargetSchema } from "./common.js";
-import { fail, ok } from "../toolResult.js";
+import { DefaultTimeoutSchema, DocumentTargetSchema, registerReadTool } from "./common.js";
+import { fail, ok, mutationOk } from "../toolResult.js";
+
+const SyncId = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine((s) => s === s.trim() && !Array.from(s).some((char) => char.charCodeAt(0) < 32));
+const SyncIdentity = {
+  projectId: SyncId,
+  boardName: SyncId,
+  schematicUuid: SyncId,
+  pcbUuid: SyncId,
+  protectedBoardName: SyncId
+};
+
+const SyncIdentitySchema = z.object(SyncIdentity);
 
 export function registerSchematicMutationTools(server: McpServer, bridge: EditorClient): void {
   server.registerTool(
@@ -31,6 +46,12 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
           .optional()
           .describe("Key-value properties to update (designator, value, footprint, rotation, mirror, etc.)"),
         designator: z.string().optional().describe("Designator to assign or update (e.g. 'R10')"),
+        uniqueId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("Explicit stable uniqueId assigned and independently verified after create"),
         value: z.string().optional().describe("Component value (e.g. '10k', '100nF')"),
         footprint: z.string().optional().describe("Footprint package name (e.g. '0603', 'SOIC-8')"),
         rotation: z.number().optional().describe("Rotation angle in degrees (0, 90, 180, 270)"),
@@ -58,6 +79,7 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
       dy,
       properties,
       designator,
+      uniqueId,
       value,
       footprint,
       rotation,
@@ -81,6 +103,7 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
             dy,
             properties,
             designator,
+            uniqueId,
             value,
             footprint,
             rotation,
@@ -360,12 +383,16 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
     {
       title: "Prepare Schematic-PCB Synchronization",
       description:
-        "Prepares a synchronization or board creation mutation between Schematic and PCB in EasyEDA Pro ('syncToPcb', 'syncToSchematic', 'createPcbFromSchematic') with cross-domain discrepancy preview and exact confirmation phrase. Does not write until confirmed via easyeda_confirmed_action.",
+        "Prepares a synchronization or board creation mutation between Schematic and PCB in EasyEDA Pro ('syncToPcb', 'syncToSchematic', 'createPcbFromSchematic') with exact confirmation. syncToPcb requires explicit projectId/boardName/schematicUuid/pcbUuid/protectedBoardName, an active matching PCB, independently scoped native manifests and UID/pin-pad net proof. Import may open an unapplied native dialog; true is not proof. It may remove obsolete parts from the target copy. Does not write until confirmed via easyeda_confirmed_action.",
       inputSchema: {
         action: z
           .enum(["syncToPcb", "syncToSchematic", "createPcbFromSchematic"])
           .describe("Synchronization or board creation action to perform"),
-        boardName: z.string().optional().describe("Name for newly created PCB document (for createPcbFromSchematic)"),
+        projectId: SyncId.optional(),
+        schematicUuid: SyncId.optional(),
+        pcbUuid: SyncId.optional(),
+        protectedBoardName: SyncId.optional(),
+        boardName: SyncId.optional().describe("Name for newly created PCB document (for createPcbFromSchematic)"),
         layerCount: z
           .number()
           .int()
@@ -386,12 +413,31 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
         openWorldHint: false
       }
     },
-    async ({ action, boardName, layerCount, width, height, schematicTarget, pcbTarget, timeoutMs }) => {
+    async ({
+      action,
+      projectId,
+      boardName,
+      schematicUuid,
+      pcbUuid,
+      protectedBoardName,
+      layerCount,
+      width,
+      height,
+      schematicTarget,
+      pcbTarget,
+      timeoutMs
+    }) => {
       try {
+        if (action === "syncToPcb")
+          SyncIdentitySchema.parse({ projectId, boardName, schematicUuid, pcbUuid, protectedBoardName });
         const result = (await bridge.call(
           "prepareSchematicPcbSync",
           {
             action,
+            projectId,
+            schematicUuid,
+            pcbUuid,
+            protectedBoardName,
             boardName,
             layerCount,
             width,
@@ -444,10 +490,32 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
         const domain = String(result.domain ?? "");
         const action = String(result.action ?? "");
         const summary = `Mutation ${mutationId} (${domain}:${action}) status: ${status}.`;
-        return ok(summary, result);
+        return mutationOk(summary, result, result);
       } catch (error) {
         return fail(error);
       }
     }
   );
+  registerReadTool(server, bridge, {
+    name: "easyeda_get_schematic_pcb_sync_state",
+    title: "Read board-scoped SCH and PCB sync manifests",
+    description:
+      "Read-only native manifest observation of every board separately. Requires explicit target SCH/PCB links and a protected board; matching target PCB must be active. Navigates through documents and restores the PCB; never imports/saves/writes CAD. Includes native UID, footprint, every assigned/unassigned pin and independent physical pad nets. Unavailable evidence fails closed.",
+    method: "readScopedPcbSyncState",
+    inputSchema: { ...SyncIdentity, timeoutMs: DefaultTimeoutSchema.default(60000) },
+    summary: "Observed scoped native manifests without importing changes."
+  });
+  registerReadTool(server, bridge, {
+    name: "easyeda_reconcile_schematic_pcb_sync",
+    title: "Reconcile a settled unknown schematic-to-PCB import read-only",
+    description:
+      "Only the lifecycle's settled unknown guarded sync receipt can be reconciled, with exact native SCH manifests, physical PCB identities/pad-net proof and unchanged other boards. No import retry, no dialog automation, no lock reset. Missing original SDK acknowledgment is disclosed; routing and manufacturing readiness remain unverified.",
+    method: "reconcileSchematicPcbSync",
+    inputSchema: {
+      mutationId: SyncId,
+      originalRecord: z.record(z.string(), z.unknown()).optional(),
+      timeoutMs: DefaultTimeoutSchema.default(60000)
+    },
+    summary: "Reconciled observed native SCH-to-PCB state without replaying import."
+  });
 }

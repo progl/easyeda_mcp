@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import type { EditorClient } from "../../editor/EditorClient.js";
 import { BridgeTimeoutError, BridgeUnavailableError } from "../../bridge/errors.js";
 import { DrcEditQuerySchema, drcConfirmation } from "../../drc/contracts.js";
-import { ok, fail } from "../toolResult.js";
+import { ok, fail, mutationOk } from "../toolResult.js";
 import { DefaultTimeoutSchema, hasExplicitMutationConfirmation } from "./common.js";
 
 export function registerActionTools(server: McpServer, bridge: EditorClient): void {
@@ -63,10 +63,11 @@ export function registerActionTools(server: McpServer, bridge: EditorClient): vo
           );
         }
         const result = await bridge.call("confirmedAction", { action, confirmation, params }, timeoutMs);
-        const response = ok(`EasyEDA Pro action result: ${action}.`, {
-          action,
-          result
-        });
+        const payload = { action, result };
+        const response =
+          action === "mutation"
+            ? mutationOk(`EasyEDA Pro action result: ${action}.`, payload, result as Record<string, unknown>)
+            : ok(`EasyEDA Pro action result: ${action}.`, payload);
         if (action === "editDrcRules" && (result as { status?: string }).status !== "applied") response.isError = true;
         if (action === "mutation" && (result as { status?: string }).status !== "applied") response.isError = true;
         return response;

@@ -4,6 +4,8 @@ import { getBoardOutlineSummary } from "../mutation/pcbOutlineMutations.js";
 import { fetchPcbCopperZones } from "../mutation/pcbCopperKeepoutMutations.js";
 import { fetchPcbTracks, fetchPcbVias } from "../mutation/pcbTrackViaMutations.js";
 import type { EasyEdaApi } from "../types.js";
+import { PCB_MIL_TO_MM } from "../pcbUnits.js";
+import { getComponentPads, normalizePcbPad } from "../pcbGeometry.js";
 
 function getProp(obj: any, getterNames: string | string[], propNames: string[]): any {
   if (!obj || typeof obj !== "object") return undefined;
@@ -74,9 +76,11 @@ export interface ComponentBoundingBox {
   x: number;
   y: number;
   rotation: number;
-  width: number;
-  height: number;
-  bounds: {
+  units: "mm";
+  geometrySource: "component_dimensions" | "pad_envelope" | "unavailable";
+  width?: number;
+  height?: number;
+  bounds?: {
     minX: number;
     minY: number;
     maxX: number;
@@ -113,7 +117,13 @@ export interface PlacementReport {
     unknown: number;
   };
   boardAreaMm2?: number;
-  totalComponentAreaMm2: number;
+  totalComponentAreaMm2?: number;
+  units: "mm";
+  nativeUnits: "mil";
+  geometryVerified: false;
+  collisionCheckComplete: boolean;
+  unknownGeometryComponents: Array<{ primitiveId: string; designator: string; reason: string }>;
+  warnings: string[];
   densityPercent?: number;
   collisionWarningsCount: number;
   collisions: PlacementCollision[];
@@ -459,27 +469,27 @@ export async function generatePcbPlacementReport(
 
   const collisionTolerance = numeric(params.collisionTolerance) ?? 0.2;
   const boardMarginTolerance = numeric(params.boardMarginTolerance) ?? 1.0;
-
-  // Board outline for density and boundary check
   const outlineSummary = await getBoardOutlineSummary(api);
   const boardAreaMm2 =
-    outlineSummary.exists && (outlineSummary.estimatedArea || (outlineSummary as any).area)
-      ? outlineSummary.estimatedArea || (outlineSummary as any).area
-      : undefined;
-  const boardBounds = outlineSummary.exists && outlineSummary.bounds ? outlineSummary.bounds : undefined;
-
+    outlineSummary.exists && outlineSummary.isClosed ? outlineSummary.estimatedArea * PCB_MIL_TO_MM ** 2 : undefined;
+  const boardBounds = outlineSummary.exists
+    ? {
+        minX: outlineSummary.bounds.minX * PCB_MIL_TO_MM,
+        maxX: outlineSummary.bounds.maxX * PCB_MIL_TO_MM,
+        minY: outlineSummary.bounds.minY * PCB_MIL_TO_MM,
+        maxY: outlineSummary.bounds.maxY * PCB_MIL_TO_MM
+      }
+    : undefined;
   const rawComponents = eda.pcb_PrimitiveComponent?.getAll ? toArray(await eda.pcb_PrimitiveComponent.getAll()) : [];
-
   const components: ComponentBoundingBox[] = [];
   const unplacedComponents: Array<{ primitiveId: string; designator: string; reason: string }> = [];
-
+  const unknownGeometryComponents: Array<{ primitiveId: string; designator: string; reason: string }> = [];
   for (const item of rawComponents) {
     const comp = item as Record<string, any>;
     const primitiveId = String(getProp(comp, "getState_PrimitiveId", ["primitiveId", "id", "uuid"]) ?? "");
     const designator = String(getProp(comp, "getState_Designator", ["designator", "name"]) ?? "");
     const footprint = stringOrUndefined(getProp(comp, "getState_Footprint", ["footprint", "package"]));
-
-    const layerId = comp?.layer ?? comp?.layerId ?? 1;
+    const layerId = getProp(comp, "getState_Layer", ["layer", "layerId"]) ?? 1;
     const layerStr = String(layerId).toLowerCase();
     const side =
       layerStr.includes("top") || layerId === 1
@@ -487,78 +497,76 @@ export async function generatePcbPlacementReport(
         : layerStr.includes("bot") || layerId === 2
           ? "bottom"
           : "unknown";
-
-    const x = numeric(getProp(comp, "getState_X", ["x", "centerX"]));
-    const y = numeric(getProp(comp, "getState_Y", ["y", "centerY"]));
-    const rotation = numeric(getProp(comp, "getState_Rotation", ["rotation", "angle"])) ?? 0;
-
-    // Determine dimensions from component properties or pins
-    const pins = toArray(
-      typeof (comp as any).getState_Pins === "function" ? (comp as any).getState_Pins() : (comp.pins ?? comp.pads ?? [])
-    );
-
-    let width = numeric(getProp(comp, "getState_Width", ["width"])) ?? 0;
-    let height = numeric(getProp(comp, "getState_Height", ["height"])) ?? 0;
-
-    if ((!width || !height) && pins.length > 0) {
-      // Estimate from pin extents
-      const xs: number[] = [];
-      const ys: number[] = [];
-      for (const pin of pins) {
-        const px = numeric(getProp(pin, "getState_X", ["x"]));
-        const py = numeric(getProp(pin, "getState_Y", ["y"]));
-        if (px !== undefined) xs.push(px);
-        if (py !== undefined) ys.push(py);
-      }
-      if (xs.length > 0 && ys.length > 0) {
-        const minPx = Math.min(...xs);
-        const maxPx = Math.max(...xs);
-        const minPy = Math.min(...ys);
-        const maxPy = Math.max(...ys);
-        width = Math.max(1.0, maxPx - minPx + 1.0);
-        height = Math.max(1.0, maxPy - minPy + 1.0);
-      }
+    const rawX = numeric(getProp(comp, "getState_X", ["x", "centerX"]));
+    const rawY = numeric(getProp(comp, "getState_Y", ["y", "centerY"]));
+    if (rawX === undefined || rawY === undefined) {
+      unplacedComponents.push({ primitiveId, designator, reason: "Missing native placement coordinates." });
+      continue;
     }
-
-    if (!width) width = 2.0;
-    if (!height) height = 2.0;
-
-    // Check if placed
-    if (x === undefined || y === undefined) {
+    const x = rawX * PCB_MIL_TO_MM,
+      y = rawY * PCB_MIL_TO_MM;
+    if (
+      boardBounds &&
+      (x < boardBounds.minX - boardMarginTolerance ||
+        x > boardBounds.maxX + boardMarginTolerance ||
+        y < boardBounds.minY - boardMarginTolerance ||
+        y > boardBounds.maxY + boardMarginTolerance)
+    ) {
       unplacedComponents.push({
         primitiveId,
         designator,
-        reason: "Missing canvas placement coordinates."
+        reason: `Position (${x}, ${y}) mm is outside board outline boundary.`
       });
       continue;
     }
-
-    // Check against board outline if outline exists
-    if (boardBounds) {
-      if (
-        x < boardBounds.minX - boardMarginTolerance ||
-        x > boardBounds.maxX + boardMarginTolerance ||
-        y < boardBounds.minY - boardMarginTolerance ||
-        y > boardBounds.maxY + boardMarginTolerance
-      ) {
-        unplacedComponents.push({
-          primitiveId,
-          designator,
-          reason: `Position (${x}, ${y}) is outside board outline boundary.`
-        });
-        continue;
+    const rotation = numeric(getProp(comp, "getState_Rotation", ["rotation", "angle"])) ?? 0;
+    const pins = await getComponentPads(comp, api);
+    const padBounds = pins.map((pin) => {
+      const pad = normalizePcbPad(pin);
+      const px = numeric(pad.x),
+        py = numeric(pad.y),
+        w = numeric(pad.width),
+        h = numeric(pad.height);
+      if (px === undefined || py === undefined || !w || !h || w <= 0 || h <= 0) return undefined;
+      const angle = (Number(pad.rotation) * Math.PI) / 180;
+      const hx = (Math.abs(Math.cos(angle)) * w + Math.abs(Math.sin(angle)) * h) / 2;
+      const hy = (Math.abs(Math.sin(angle)) * w + Math.abs(Math.cos(angle)) * h) / 2;
+      return {
+        minX: (px - hx) * PCB_MIL_TO_MM,
+        maxX: (px + hx) * PCB_MIL_TO_MM,
+        minY: (py - hy) * PCB_MIL_TO_MM,
+        maxY: (py + hy) * PCB_MIL_TO_MM
+      };
+    });
+    let bounds: ComponentBoundingBox["bounds"];
+    let geometrySource: ComponentBoundingBox["geometrySource"] = "unavailable";
+    if (padBounds.length && padBounds.every((pad) => pad !== undefined)) {
+      const values = padBounds as NonNullable<(typeof padBounds)[number]>[];
+      bounds = {
+        minX: Math.min(...values.map((v) => v.minX)),
+        maxX: Math.max(...values.map((v) => v.maxX)),
+        minY: Math.min(...values.map((v) => v.minY)),
+        maxY: Math.max(...values.map((v) => v.maxY))
+      };
+      geometrySource = "pad_envelope";
+    } else {
+      const w = numeric(getProp(comp, "getState_Width", ["width"]));
+      const h = numeric(getProp(comp, "getState_Height", ["height"]));
+      if (w && h && w > 0 && h > 0) {
+        const angle = (rotation * Math.PI) / 180;
+        const hx = ((Math.abs(Math.cos(angle)) * w + Math.abs(Math.sin(angle)) * h) * PCB_MIL_TO_MM) / 2;
+        const hy = ((Math.abs(Math.sin(angle)) * w + Math.abs(Math.cos(angle)) * h) * PCB_MIL_TO_MM) / 2;
+        bounds = { minX: x - hx, maxX: x + hx, minY: y - hy, maxY: y + hy };
+        geometrySource = "component_dimensions";
       }
     }
-
-    const halfW = width / 2;
-    const halfH = height / 2;
-    const bounds = {
-      minX: Number((x - halfW).toFixed(4)),
-      minY: Number((y - halfH).toFixed(4)),
-      maxX: Number((x + halfW).toFixed(4)),
-      maxY: Number((y + halfH).toFixed(4))
-    };
-
+    if (!bounds)
+      unknownGeometryComponents.push({
+        primitiveId,
+        designator,
+        reason:
+          "No complete component dimensions or native pad shapes; geometry is unavailable, no default size substituted."
+      });
     components.push({
       primitiveId,
       designator,
@@ -568,9 +576,15 @@ export async function generatePcbPlacementReport(
       x,
       y,
       rotation,
-      width: Number(width.toFixed(4)),
-      height: Number(height.toFixed(4)),
-      bounds,
+      units: "mm",
+      geometrySource,
+      ...(bounds
+        ? {
+            width: Number((bounds.maxX - bounds.minX).toFixed(4)),
+            height: Number((bounds.maxY - bounds.minY).toFixed(4)),
+            bounds
+          }
+        : {}),
       isPlaced: true,
       padCount: pins.length
     });
@@ -583,8 +597,8 @@ export async function generatePcbPlacementReport(
       const c1 = components[i];
       const c2 = components[j];
 
-      // Collisions only occur between components on the same side
-      if (c1.side !== c2.side) continue;
+      // Missing geometry cannot certify clearances. Compare only known boxes on known sides.
+      if (!c1.bounds || !c2.bounds || c1.side === "unknown" || c1.side !== c2.side) continue;
 
       // Expand c1 bounds by collisionTolerance
       const overlapX = Math.max(0, Math.min(c1.bounds.maxX, c2.bounds.maxX) - Math.max(c1.bounds.minX, c2.bounds.minX));
@@ -628,21 +642,41 @@ export async function generatePcbPlacementReport(
     unknown: components.filter((c) => c.side === "unknown").length
   };
 
-  const totalComponentAreaMm2 = Number(components.reduce((sum, c) => sum + c.width * c.height, 0).toFixed(2));
+  const totalComponentAreaMm2 = unknownGeometryComponents.length
+    ? undefined
+    : Number(components.reduce((sum, c) => sum + (c.width ?? 0) * (c.height ?? 0), 0).toFixed(2));
 
   const densityPercent =
-    boardAreaMm2 && boardAreaMm2 > 0 ? Number(((totalComponentAreaMm2 / boardAreaMm2) * 100).toFixed(1)) : undefined;
+    boardAreaMm2 && boardAreaMm2 > 0 && totalComponentAreaMm2 !== undefined
+      ? Number(((totalComponentAreaMm2 / boardAreaMm2) * 100).toFixed(1))
+      : undefined;
 
   return {
     target: currentTarget,
     method: "geometry_bounding_box",
+    units: "mm",
+    nativeUnits: "mil",
+    geometryVerified: false,
+    collisionCheckComplete:
+      unknownGeometryComponents.length === 0 &&
+      unplacedComponents.length === 0 &&
+      components.every((c) => c.side !== "unknown"),
+    unknownGeometryComponents,
+    warnings: [
+      ...(!boardBounds
+        ? ["No board outline: component positions are present but board containment is unverified."]
+        : []),
+      ...(unknownGeometryComponents.length
+        ? ["Missing geometry: zero reported collisions does not mean the placement is clear."]
+        : [])
+    ],
     tolerances: {
       collisionTolerance,
       boardMarginTolerance,
       unit: "mm"
     },
     inferenceLimits:
-      "Component collision analysis uses rectangular bounding boxes derived from component dimensions or pad envelopes. For complex connector overhangs, fiducials or 3D STEP bodies, consult 3D canvas preview.",
+      "All reported lengths are mm converted from native mil. Rectangular component dimensions or pad envelopes are estimates, not verified body/courtyard clearances. Missing dimensions remain unavailable; no 2x2 fallback is used. A pad envelope may exclude connector overhangs and the ESP32 antenna keepout. Density uses outline bounding area.",
     totalComponents: rawComponents.length,
     placedComponentsCount: components.length,
     unplacedComponentsCount: unplacedComponents.length,

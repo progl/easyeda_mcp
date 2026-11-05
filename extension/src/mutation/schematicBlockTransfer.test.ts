@@ -71,7 +71,9 @@ describe("block transfer", () => {
     f.eda.sch_PrimitiveAttribute = {
       getAll: async (id?: string) =>
         id === "c1" ? [source] : id === "copy" ? [dest] : f.active() === "p1" ? [source] : [dest],
-      modify: vi.fn(async (_: string, p: any) => Object.assign(dest, p))
+      modify: vi.fn(async (_: string, p: any) =>
+        Object.assign(dest, { ...p, ...(typeof p.y === "number" ? { y: -p.y } : {}) })
+      )
     };
     const p = await prepareBlockTransfer(f.api, params);
     await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
@@ -128,4 +130,125 @@ describe("block transfer", () => {
     await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
     expect(f.eda.sch_PrimitiveComponent.create.mock.calls[0][0].uuid).toBe("a".repeat(32));
   });
+});
+
+it("uses public attribute units instead of internal inch-sized font fields", async () => {
+  const f = pageFixture();
+  const source: any = {
+    primitiveId: "a1",
+    parentPrimitiveId: "c1",
+    key: "Name",
+    value: "10k",
+    x: 100,
+    y: 120,
+    fontSize: 0.0675,
+    getState_FontSize() {
+      return this.fontSize * 100;
+    }
+  };
+  const dest: any = { ...source, primitiveId: "a2", parentPrimitiveId: "copy" };
+  f.eda.sch_PrimitiveAttribute = {
+    getAll: async (id?: string) =>
+      id === "c1" ? [source] : id === "copy" ? [dest] : f.active() === "p1" ? [source] : [dest],
+    modify: vi.fn(async (_: string, p: any) => {
+      Object.assign(dest, p);
+      if (p.fontSize !== undefined) dest.fontSize = p.fontSize / 100;
+      return dest;
+    })
+  };
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(dest.getState_FontSize()).toBeCloseTo(6.75);
+  expect(f.components.p1).toHaveLength(0);
+});
+
+it("transfers identities even when the editor rejects duplicates across pages", async () => {
+  const f = pageFixture();
+  f.eda.sch_PrimitiveComponent.modify.mockImplementation(async (id: string, patch: any) => {
+    const c = f.components[f.active()].find((c) => c.primitiveId === id);
+    for (const key of ["designator", "uniqueId"])
+      if (
+        patch[key] &&
+        Object.values(f.components)
+          .flat()
+          .some((other) => other !== c && other[key] === patch[key])
+      )
+        throw new Error("Duplicate " + key);
+    Object.assign(c, patch);
+    return c;
+  });
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(f.components.p2[0]).toMatchObject({ designator: "R1", uniqueId: "uid1" });
+  expect(f.components.p1).toHaveLength(0);
+});
+
+it("does not retire source identities when annotation verification fails", async () => {
+  const f = pageFixture();
+  const source = { primitiveId: "a1", parentPrimitiveId: "c1", key: "Name", value: "10k", x: 100, y: 120 };
+  const dest = { ...source, primitiveId: "a2", parentPrimitiveId: "copy", x: 0 };
+  f.eda.sch_PrimitiveAttribute = {
+    getAll: async (id?: string) =>
+      id === "c1" ? [source] : id === "copy" ? [dest] : f.active() === "p1" ? [source] : [dest],
+    modify: vi.fn(async () => undefined)
+  };
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  await expect(executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api)).rejects.toThrow(
+    /Annotation readback failed/
+  );
+  expect(f.components.p1[0]).toMatchObject({ designator: "R1", uniqueId: "uid1" });
+  expect(f.eda.sch_PrimitiveComponent.delete).not.toHaveBeenCalled();
+});
+
+it("keeps both sides and an identity journal if final handoff fails", async () => {
+  const f = pageFixture();
+  f.eda.sch_PrimitiveComponent.modify.mockImplementation(async (id: string, patch: any) => {
+    if (f.active() === "p2" && patch.designator === "R1") throw new Error("handoff rejected");
+    const c = f.components[f.active()].find((c) => c.primitiveId === id);
+    Object.assign(c, patch);
+    return c;
+  });
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  const record = extensionMutations.get(String(p.mutationId));
+  await expect(executeBlockTransfer(record, f.api)).rejects.toThrow(/assign_destination_identity/);
+  expect(f.components.p1).toHaveLength(1);
+  expect(f.components.p2).toHaveLength(1);
+  expect(f.eda.sch_PrimitiveComponent.delete).not.toHaveBeenCalled();
+  expect((record.operation as any).progress.identityTransfers[0].original).toEqual({
+    designator: "R1",
+    uniqueId: "uid1"
+  });
+});
+
+it("waits for delayed wire readback before retiring source identities", async () => {
+  const f = pageFixture();
+  let stale = true;
+  f.eda.sch_PrimitiveWire.getAll = vi.fn(async () => {
+    if (f.active() === "p2" && f.wires.p2.length && stale) {
+      stale = false;
+      return [];
+    }
+    return f.wires[f.active()];
+  });
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(f.components.p1).toHaveLength(0);
+  expect(f.components.p2[0].designator).toBe("R1");
+});
+
+it("refreshes native connectivity before checking newly created wire net names", async () => {
+  const f = pageFixture();
+  let published = false;
+  f.eda.sch_PrimitiveWire.getAll = async () =>
+    f.active() === "p2" && !published ? f.wires.p2.map((w) => ({ ...w, net: "$PENDING" })) : f.wires[f.active()];
+  f.eda.sch_ManufactureData = {
+    getNetlistFile: vi.fn(async () => {
+      published = true;
+      return { text: async () => "(\nGND\nR1-1\n)" };
+    })
+  };
+  const p = await prepareBlockTransfer(f.api, { components: ["R1"], destinationPageId: "p2" });
+  await executeBlockTransfer(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(f.eda.sch_ManufactureData.getNetlistFile).toHaveBeenCalled();
+  expect(f.components.p1).toHaveLength(0);
 });

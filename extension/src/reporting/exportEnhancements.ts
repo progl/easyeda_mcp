@@ -1,4 +1,4 @@
-import { inferDocumentType, sanitize, timestamp, toArray } from "../helpers.js";
+import { apiError, inferDocumentType, sanitize, timestamp } from "../helpers.js";
 import type { EasyEdaApi } from "../types.js";
 
 export type ExportImageFormat = "png" | "svg" | "jpg";
@@ -31,7 +31,7 @@ export interface Export3dParams {
   timeoutMs?: number;
 }
 
-export type ExportProjectFormat = "epro" | "zip" | "json";
+export type ExportProjectFormat = "epro" | "epro2";
 
 export interface ExportProjectArchiveParams {
   fileName?: string;
@@ -120,6 +120,65 @@ export function validateExportDestination(
     resolvedFileName: trimmed,
     resolvedPath
   };
+}
+
+function hasStepGeometry(text: string): boolean {
+  if (!/^\s*ISO-10303-21\s*;/i.test(text) || !/END-ISO-10303-21\s*;/i.test(text)) return false;
+  const data = text.match(/\bDATA\s*;([\s\S]*?)\bENDSEC\s*;/i)?.[1];
+  if (!data) return false;
+  const scalar = "[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[Ee][-+]?[0-9]+)?";
+  const points = [
+    ...data.matchAll(
+      new RegExp(
+        `CARTESIAN_POINT\\s*\\([^()]*\\(\\s*(${scalar})\\s*,\\s*(${scalar})\\s*,\\s*(${scalar})\\s*\\)\\s*\\)`,
+        "gi"
+      )
+    )
+  ].map((m) => m.slice(1, 4).map(Number));
+  // Tessellated STEP uses a point-list entity rather than individual points.
+  const list = data.match(/CARTESIAN_POINT_LIST_3D\s*\([^;]+/i)?.[0];
+  if (list)
+    for (const m of list.matchAll(new RegExp(`\\(\\s*(${scalar})\\s*,\\s*(${scalar})\\s*,\\s*(${scalar})\\s*\\)`, "g")))
+      points.push(m.slice(1, 4).map(Number));
+  const unique = points.filter((p) => p.every(Number.isFinite));
+  let noncollinear = false;
+  if (unique.length >= 3) {
+    const a = unique[0],
+      b = unique.find((p) => Math.hypot(...p.map((x, i) => x - a[i])) > 1e-9);
+    if (b)
+      noncollinear = unique.some(
+        (c) =>
+          Math.hypot(
+            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+          ) > 1e-12
+      );
+  }
+  return (
+    noncollinear &&
+    /#\d+\s*=\s*(ADVANCED_FACE|FACE_SURFACE|FACE|TRIANGULATED_FACE_SET|POLYGONAL_FACE_SET)\s*\(/i.test(data) &&
+    /#\d+\s*=\s*(MANIFOLD_SOLID_BREP|FACETED_BREP|SHELL_BASED_SURFACE_MODEL|(?:ADVANCED_BREP_|TESSELLATED_)?SHAPE_REPRESENTATION)\s*\(/i.test(
+      data
+    )
+  );
+}
+function hasObjGeometry(text: string): boolean {
+  const vertices = [...text.matchAll(/^v\s+([^\r\n]+)$/gm)].map((m) =>
+    m[1].trim().split(/\s+/).slice(0, 3).map(Number)
+  );
+  if (vertices.length < 3 || vertices.some((v) => v.length !== 3 || !v.every(Number.isFinite))) return false;
+  return [...text.matchAll(/^f\s+([^\r\n]+)$/gm)].some((m) => {
+    const indices = m[1]
+      .trim()
+      .split(/\s+/)
+      .map((v) => Number(v.split("/")[0]));
+    return (
+      indices.length >= 3 &&
+      new Set(indices).size >= 3 &&
+      indices.every((i) => Number.isInteger(i) && i !== 0 && (i > 0 ? i <= vertices.length : -i <= vertices.length))
+    );
+  });
 }
 
 /**
@@ -220,25 +279,30 @@ export function validateExportContent(
     }
     case "step":
     case "stp": {
-      const hasStepHeader =
-        textSample.includes("ISO-10303-21") ||
-        textSample.includes("FILE_DESCRIPTION") ||
-        textSample.includes("HEADER;");
+      const text = typeof data === "string" ? data : "";
+      const hasStepHeader = /^\s*ISO-10303-21\s*;/i.test(text);
       checks.push({
         check: "step_iso_header",
-        passed: hasStepHeader || isBinary,
+        passed: hasStepHeader,
         message: hasStepHeader
-          ? "Valid STEP CAD format detected (ISO-10303-21 standard header present)."
-          : "STEP ISO-10303-21 standard header signature missing."
+          ? "STEP ISO-10303-21 header detected."
+          : "STEP text header unavailable/unrecognized; binary size alone is not evidence."
+      });
+      checks.push({
+        check: "step_geometry_entities",
+        passed: hasStepGeometry(text),
+        message:
+          "Requires a complete STEP DATA section with noncollinear coordinates, surface faces and shape representation. Structural screening does not prove model completeness or CAD validity."
       });
       break;
     }
     case "obj": {
-      const hasObjTokens = textSample.includes("v ") || textSample.includes("#") || textSample.includes("f ");
+      const geometry = typeof data === "string" && hasObjGeometry(data);
       checks.push({
         check: "obj_tokens",
-        passed: hasObjTokens || isBinary,
-        message: hasObjTokens ? "Valid Wavefront OBJ 3D vertex/face tokens detected." : "OBJ geometry tokens missing."
+        passed: geometry,
+        message:
+          "Requires finite 3D vertices and an indexed face; comments, headers and arbitrary binary are insufficient."
       });
       break;
     }
@@ -462,50 +526,55 @@ export async function export3dModel(
     quality: params.quality ?? "high"
   };
 
+  if (!["step", "obj"].includes(format) || typeof eda.pcb_ManufactureData?.get3DFile !== "function")
+    throw apiError(
+      "api_unavailable",
+      "Native pcb_ManufactureData.get3DFile is required and supports STEP/OBJ only; no synthetic fallback is permitted."
+    );
+  const elements: Array<"Component Model" | "Via" | "Silkscreen" | "Wire In Signal Layer"> = [];
+  if (exportOptions.includeComponents3D) elements.push("Component Model");
+  if (exportOptions.includeCopper) elements.push("Via", "Wire In Signal Layer");
+  if (exportOptions.includeSilkscreen) elements.push("Silkscreen");
   let rawResult: unknown;
-  const mimeType = format === "step" ? "application/step" : format === "obj" ? "model/obj" : "model/stl";
-
-  if (format === "step") {
-    if (eda.pcb_Document?.exportStep) {
-      rawResult = await eda.pcb_Document.exportStep(baseName, exportOptions);
-    } else if (eda.pcb_ManufactureData?.getStepFile) {
-      rawResult = await eda.pcb_ManufactureData.getStepFile(baseName);
-    } else if (eda.pcb_Document?.export3D) {
-      rawResult = await eda.pcb_Document.export3D(baseName, "step", exportOptions);
-    }
-  } else if (format === "obj") {
-    if (eda.pcb_Document?.exportObj) {
-      rawResult = await eda.pcb_Document.exportObj(baseName, exportOptions);
-    } else if (eda.pcb_ManufactureData?.getObjFile) {
-      rawResult = await eda.pcb_ManufactureData.getObjFile(baseName);
-    } else if (eda.pcb_Document?.export3D) {
-      rawResult = await eda.pcb_Document.export3D(baseName, "obj", exportOptions);
-    }
-  } else if (format === "stl") {
-    if (eda.pcb_Document?.exportStl) {
-      rawResult = await eda.pcb_Document.exportStl(baseName, exportOptions);
-    } else if (eda.pcb_ManufactureData?.getStlFile) {
-      rawResult = await eda.pcb_ManufactureData.getStlFile(baseName);
-    } else if (eda.pcb_Document?.export3D) {
-      rawResult = await eda.pcb_Document.export3D(baseName, "stl", exportOptions);
-    }
-  } else if (eda.pcb_3d?.export) {
-    rawResult = await eda.pcb_3d.export(baseName, format, exportOptions);
+  try {
+    rawResult = await eda.pcb_ManufactureData.get3DFile(baseName, format, elements, "Outfit", false);
+  } catch (error) {
+    throw apiError(
+      "export_outcome_unknown",
+      `Native 3D export dispatched but failed: ${String(error)}. Inspect native output; do not retry automatically.`,
+      { status: "unknown", format }
+    );
   }
-
-  // Fallback mock CAD data structure if running in tests
-  if (!rawResult) {
-    if (format === "step") {
-      rawResult = `ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('EasyEDA Pro PCB 3D STEP Model'),'2;1');\nFILE_NAME('${fileName}','${new Date().toISOString()}',('Author'),('EasyEDA MCP'),'EasyEDA CAD Processor','EasyEDA Pro','');\nFILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\nDATA;\n#1=APPLICATION_CONTEXT('core data for automotive mechanical design processes');\n#2=APPLICATION_PROTOCOL_DEFINITION('international standard','config_control_design',1994,#1);\nENDSEC;\nEND-ISO-10303-21;\n`;
-    } else if (format === "obj") {
-      rawResult = `# EasyEDA Pro 3D OBJ Export\nv 0.0 0.0 0.0\nv 100.0 0.0 0.0\nv 100.0 80.0 0.0\nv 0.0 80.0 0.0\nf 1 2 3 4\n`;
-    } else {
-      rawResult = `solid ${baseName}\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 10 0 0\nvertex 0 10 0\nendloop\nendfacet\nendsolid ${baseName}\n`;
-    }
-  }
-
+  if (rawResult === undefined || rawResult === null)
+    throw apiError(
+      "export_outcome_unknown",
+      "Native 3D export returned no file after dispatch; inspect output before any retry. No synthetic file saved.",
+      { status: "unknown", format }
+    );
+  const mimeType = format === "step" ? "application/step" : "model/obj";
   const normalizedFile = normalizeOutputToFile(rawResult, fileName, mimeType);
-  const validation = validateExportContent(format, rawResult, fileName, params.destinationPath);
+  let text: string;
+  try {
+    if (typeof normalizedFile === "string") text = normalizedFile;
+    else if (typeof Blob !== "undefined" && normalizedFile instanceof Blob) text = await normalizedFile.text();
+    else if (normalizedFile instanceof ArrayBuffer) text = new TextDecoder().decode(normalizedFile);
+    else if (ArrayBuffer.isView(normalizedFile))
+      text = new TextDecoder().decode(normalizedFile as ArrayBufferView<ArrayBuffer>);
+    else throw new Error("Native output has no readable geometry payload.");
+  } catch (error) {
+    throw apiError(
+      "export_outcome_unknown",
+      `Native 3D file geometry could not be inspected: ${String(error)}. No save/retry performed.`,
+      { status: "unknown", format }
+    );
+  }
+  const validation = validateExportContent(format, text, fileName, params.destinationPath);
+  if (!validation.valid)
+    throw apiError(
+      "export_outcome_unknown",
+      "Native 3D export contains no verified structural geometry or has invalid destination; no file saved. Inspect native output before retry.",
+      { status: "unknown", format, validation }
+    );
   const saveResult = await saveFileFn(normalizedFile, fileName);
 
   return {
@@ -515,6 +584,8 @@ export async function export3dModel(
     includeCopper: exportOptions.includeCopper,
     includeSilkscreen: exportOptions.includeSilkscreen,
     quality: exportOptions.quality,
+    autoGenerateModels: false,
+    modelCompletenessVerified: false,
     validation: sanitize(validation),
     metadata: {
       fileName,
@@ -531,78 +602,114 @@ export async function exportProjectArchive(
   saveFileFn: (file: unknown, name: string) => Promise<Record<string, unknown>>,
   params: ExportProjectArchiveParams
 ): Promise<Record<string, unknown>> {
-  const eda = api();
-  const format: ExportProjectFormat = params.format ?? "epro";
-  const baseName = params.fileName?.trim() || `easyeda-project-${timestamp()}`;
-  const fileName = baseName.endsWith(`.${format}`) ? baseName : `${baseName}.${format}`;
-
-  const projInfo = eda.dmt_Project?.getCurrentProjectInfo?.() ?? {};
-  const projectName = projInfo.title ?? projInfo.name ?? "EasyEDA_Project";
-  const projectId = projInfo.uuid ?? projInfo.id ?? "proj-1";
-
-  // Gather documents manifest
-  const docList: Array<Record<string, unknown>> = [];
-  try {
-    const rawDocs = eda.dmt_Project?.getProjectData?.() ?? eda.dmt_Document?.getAllDocument?.();
-    const list = toArray(rawDocs);
-    for (const item of list) {
-      if (item && typeof item === "object") {
-        const d = item as Record<string, any>;
-        docList.push({
-          uuid: d.uuid ?? d.id,
-          name: d.name ?? d.title,
-          docType: d.docType ?? d.type
-        });
-      }
+  const eda = api(),
+    format = params.format ?? "epro";
+  if (!["epro", "epro2"].includes(format))
+    throw apiError(
+      "api_unavailable",
+      "Public native project export supports epro/epro2 only; no metadata-only ZIP/JSON fallback."
+    );
+  const native = eda.sys_FileManager;
+  if (typeof native?.getProjectFileByProjectUuid !== "function" && typeof native?.getProjectFile !== "function")
+    throw apiError(
+      "api_unavailable",
+      "Official sys_FileManager.getProjectFileByProjectUuid/getProjectFile unavailable; no synthetic backup is generated."
+    );
+  if (typeof eda.dmt_Project?.getCurrentProjectInfo !== "function")
+    throw apiError("api_unavailable", "Independent current project identity required before backup.");
+  if (params.destinationPath)
+    throw apiError(
+      "invalid_params",
+      "Native saveFile does not select destinationPath; choose the download location externally and verify the resulting file."
+    );
+  const rawBase = params.fileName?.trim() || `easyeda-project-${timestamp()}`;
+  const baseName = rawBase.toLowerCase().endsWith(`.${format}`) ? rawBase.slice(0, -format.length - 1) : rawBase;
+  const fileName = `${baseName}.${format}`;
+  const dest = validateExportDestination(fileName);
+  if (!dest.valid) throw apiError("invalid_params", dest.error ?? "Invalid backup filename.");
+  const budgetMs = Math.min(50000, Math.max(1000, (params.timeoutMs ?? 60000) - 1000)),
+    deadline = Date.now() + budgetMs;
+  const bounded = async <T>(step: string, fn: () => T | Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`Backup deadline expired before ${step}`);
+    try {
+      return await Promise.race([
+        Promise.resolve().then(fn),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Native backup ${step} exceeded total${budgetMs}ms; no cancellation/retry.`)),
+            remaining
+          );
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-  } catch {
-    // Continue with basic info
+  };
+  const project = await bounded("current project identity", () => eda.dmt_Project.getCurrentProjectInfo());
+  const projectId = project?.uuid;
+  if (typeof projectId !== "string" || !projectId)
+    throw apiError("invalid_target", "Native backup requires current project UUID, not an invented fallback.");
+  let file: unknown;
+  try {
+    file =
+      typeof native.getProjectFileByProjectUuid === "function"
+        ? await bounded("getProjectFileByProjectUuid", () =>
+            native.getProjectFileByProjectUuid(projectId, baseName, undefined, format)
+          )
+        : await bounded("getProjectFile", () => native.getProjectFile(baseName, undefined, format));
+    if (typeof File === "undefined" || !(file instanceof File) || file.size === 0)
+      throw new Error("Native export did not return a nonempty File; metadata/string/blob are not a project backup.");
+    const nativePayload = file as File;
+    const prefix = await bounded("read native file prefix", () => nativePayload.slice(0, 1024).text());
+    const leading = prefix.trimStart()[0];
+    if (leading === "{" || leading === "[")
+      throw new Error("Native output is JSON/manifest-like rather than a project archive; no save.");
+    const after = await bounded("current project identity after export", () => eda.dmt_Project.getCurrentProjectInfo());
+    if (after?.uuid !== projectId) throw new Error("Active project changed during native backup export.");
+  } catch (error) {
+    throw apiError(
+      "export_outcome_unknown",
+      `Native project backup outcome unconfirmed: ${String(error)}. No synthetic save or automatic retry.`,
+      { projectId, format, status: "unknown" }
+    );
   }
-
-  let rawResult: unknown;
-  if (eda.dmt_Project?.exportProject) {
-    rawResult = await eda.dmt_Project.exportProject(baseName, format);
-  } else if (eda.dmt_Document?.export) {
-    rawResult = await eda.dmt_Document.export(format);
-  } else if (eda.dmt_Project?.getProjectData) {
-    rawResult = await eda.dmt_Project.getProjectData();
+  const nativeFile = file as File;
+  let saveResult: Record<string, unknown>;
+  try {
+    saveResult = await bounded("save native project File", () => saveFileFn(nativeFile, fileName));
+  } catch (error) {
+    throw apiError(
+      "export_outcome_unknown",
+      `Native project file received but save outcome unknown: ${String(error)}. Inspect downloads before retrying.`,
+      { projectId, fileName, nativeFileSizeBytes: nativeFile.size, status: "unknown" }
+    );
   }
-
-  // Fallback bundle JSON for mock/test environments
-  if (!rawResult) {
-    const archiveBundle = {
-      project: { id: projectId, name: projectName, exportedAt: new Date().toISOString() },
-      manifest: {
-        format,
-        documentsCount: docList.length,
-        documents: docList
-      },
-      settings: {
-        includeLibraries: params.includeLibraries !== false,
-        includeHistory: Boolean(params.includeHistory)
-      }
-    };
-    rawResult = JSON.stringify(archiveBundle, null, 2);
-  }
-
-  const mimeType = format === "json" ? "application/json" : "application/zip";
-  const normalizedFile = normalizeOutputToFile(rawResult, fileName, mimeType);
-  const validation = validateExportContent(format, rawResult, fileName, params.destinationPath);
-  const saveResult = await saveFileFn(normalizedFile, fileName);
-
   return {
     ...saveResult,
     format,
-    projectName,
     projectId,
-    documentCount: docList.length,
-    documents: docList,
-    validation: sanitize(validation),
+    projectName: project.friendlyName ?? project.title ?? project.name ?? null,
+    nativeFileReceived: true,
+    nativeFileName: nativeFile.name,
+    nativeFileSizeBytes: nativeFile.size,
+    backupVerified: false,
+    archiveContentsVerified: false,
+    restorationVerified: false,
+    validation: {
+      nativeFileObserved: true,
+      nonemptyPayload: true,
+      jsonManifestRejected: true,
+      projectCompletenessVerified: false,
+      warning:
+        "Real native File exported; neither a filename/byte count nor a manifest proves complete/restorable CAD backup. Independently inspect the saved file and test restoration on a copy."
+    },
     metadata: {
       fileName,
-      destinationPath: validation.destinationPath,
-      includeLibraries: params.includeLibraries !== false,
-      includeHistory: Boolean(params.includeHistory)
+      requestedIncludeLibraries: params.includeLibraries !== false,
+      requestedIncludeHistory: Boolean(params.includeHistory),
+      nativeInclusionSettingsVerified: false
     }
   };
 }

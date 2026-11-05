@@ -36,6 +36,16 @@ describe("schematic page MCP tools", () => {
         arguments: { components: [], destinationPageId: "p2" }
       });
       expect(bad.isError).toBe(true);
+      const audit = await client.callTool({
+        name: "easyeda_audit_schematic_connectivity",
+        arguments: { nativeNetlistTimeoutMs: 15000, timeoutMs: 60000 }
+      });
+      expect(audit.isError).toBeFalsy();
+      expect(bridge.call).toHaveBeenCalledWith(
+        "auditSchematicConnectivity",
+        expect.objectContaining({ nativeNetlistTimeoutMs: 15000 }),
+        60000
+      );
     } finally {
       await client.close();
       await server.close();

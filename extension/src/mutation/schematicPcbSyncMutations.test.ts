@@ -180,57 +180,13 @@ describe("schematicPcbSyncMutations", () => {
   });
 
   describe("prepareSchematicPcbSyncMutation & confirmed execution", () => {
-    it("prepares and executes syncToPcb mutation", async () => {
-      let importedChanges = false;
-      const mockApi: EasyEdaApi = {
-        dmt_SelectControl: {
-          getCurrentDocumentInfo: vi.fn(async () => ({
-            documentType: "schematic",
-            uuid: "doc-sch-1",
-            title: "Main.json"
-          }))
-        },
-        sch_PrimitiveComponent: {
-          getAll: vi.fn(async () => [{ primitiveId: "sch-r1", designator: "R1", value: "10k", footprint: "0603" }])
-        },
-        sch_Net: {
-          getAllNetsName: vi.fn(async () => ["GND", "VCC"])
-        },
-        pcb_PrimitiveComponent: {
-          getAll: vi.fn(async () =>
-            importedChanges ? [{ primitiveId: "pcb-r1", designator: "R1", footprint: "0603" }] : []
-          )
-        },
-        pcb_Net: {
-          getAllNetsName: vi.fn(async () => (importedChanges ? ["GND", "VCC"] : []))
-        },
-        pcb_Document: {
-          importChanges: vi.fn(async () => {
-            importedChanges = true;
-            return { success: true };
-          })
-        }
-      };
-
-      const prep = await prepareSchematicPcbSyncMutation(() => mockApi, {
-        action: "syncToPcb"
+    it("refuses legacy unscoped sync previews before any native import", async () => {
+      const importChanges = vi.fn(async () => true);
+      const api = () => ({ pcb_Document: { importChanges } });
+      await expect(prepareSchematicPcbSyncMutation(api, { action: "syncToPcb" })).rejects.toMatchObject({
+        code: "invalid_params"
       });
-
-      expect(typeof prep.mutationId).toBe("string");
-      expect(prep.confirmation).toContain("CONFIRM sync:syncToPcb");
-      expect((prep.preview as any).impact).toContain("Synchronizes schematic to PCB");
-
-      const actionHandlers = createActionHandlers(() => mockApi, {} as any, extensionMutations);
-      const res = (await actionHandlers.confirmedAction({
-        action: "mutation",
-        params: { mutationId: prep.mutationId },
-        confirmation: prep.confirmation
-      })) as any;
-
-      expect(res.status).toBe("applied");
-      expect(res.after.action).toBe("syncToPcb");
-      expect(res.after.verified).toBe(true);
-      expect(mockApi.pcb_Document.importChanges).toHaveBeenCalled();
+      expect(importChanges).not.toHaveBeenCalled();
     });
 
     it("prepares and executes createPcbFromSchematic mutation", async () => {

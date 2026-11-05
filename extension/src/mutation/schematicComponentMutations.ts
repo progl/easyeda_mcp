@@ -1,11 +1,35 @@
 import { prepareSchematicPage } from "./schematicPages.js";
 import { prepareBlockTransfer } from "./schematicBlockTransfer.js";
 import { preparePinNets, executePinNets } from "./schematicPinNets.js";
+import {
+  prepareSchematicAnnotation,
+  executeSchematicAnnotation,
+  prepareSchematicLayout,
+  executeSchematicLayout,
+  prepareSchematicAttributeLayout,
+  executeSchematicAttributeLayout
+} from "./schematicLayout.js";
 import { apiError, ensureApi, isNumber, isRecord, numeric, optionalCall, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
 import type { EasyEdaApi } from "../types.js";
 import type { MutationRecord } from "../../../src/mutation/contracts.js";
+
+// Cached schematic component UUIDs may be project-local 16-character IDs.
+// Public catalog placement requires the 32-character device AND library identifiers.
+function assertCatalogDeviceReference(device: unknown): asserts device is Record<string, unknown> {
+  if (
+    !isRecord(device) ||
+    typeof device.uuid !== "string" ||
+    !/^[a-z0-9]{32}$/i.test(device.uuid) ||
+    typeof device.libraryUuid !== "string" ||
+    !/^[a-z0-9]{32}$/i.test(device.libraryUuid)
+  )
+    throw apiError(
+      "invalid_device_reference",
+      "Placement requires a public catalog device item with 32-character uuid and libraryUuid. Do not pass cached schematic.component references; resolve through lib_Device.search first."
+    );
+}
 
 export type ResolvedComponent = {
   primitiveId: string;
@@ -22,7 +46,7 @@ export type ResolvedComponent = {
 export async function findComponentInSchematic(api: () => EasyEdaApi, identifier: string): Promise<ResolvedComponent> {
   const eda = api();
   ensureApi("sch_PrimitiveComponent", "getAll", eda);
-  const rawComponents = toArray(await eda.sch_PrimitiveComponent.getAll(undefined, true));
+  const rawComponents = toArray(await eda.sch_PrimitiveComponent.getAll(undefined, false));
 
   const trimmed = identifier.trim();
   const upper = trimmed.toUpperCase();
@@ -82,11 +106,21 @@ export async function prepareSchematicComponentMutation(
   if (action === "update" && params.component === "@schematic") {
     const properties = params.properties;
     if (!isRecord(properties) || Object.keys(properties).length !== 1)
-      throw apiError("invalid_params", "@schematic accepts exactly one page or transfer object.");
+      throw apiError(
+        "invalid_params",
+        "@schematic accepts exactly one page, transfer, annotation, layout or attributeLayout object."
+      );
     if (isRecord(properties.page)) return prepareSchematicPage(api, { ...properties.page, target: currentTarget });
     if (isRecord(properties.transfer))
       return prepareBlockTransfer(api, { ...properties.transfer, target: currentTarget });
-    throw apiError("invalid_params", "@schematic requires page or transfer properties.");
+    if (isRecord(properties.annotation)) return prepareSchematicAnnotation(api, properties.annotation, currentTarget);
+    if (isRecord(properties.layout)) return prepareSchematicLayout(api, properties.layout, currentTarget);
+    if (isRecord(properties.attributeLayout))
+      return prepareSchematicAttributeLayout(api, properties.attributeLayout, currentTarget);
+    throw apiError(
+      "invalid_params",
+      "@schematic requires page, transfer, annotation, layout or attributeLayout properties."
+    );
   }
   if (action === "update" && isRecord(params.properties) && params.properties.pinNets !== undefined) {
     return preparePinNets(api, params, currentTarget);
@@ -99,6 +133,8 @@ export async function prepareSchematicComponentMutation(
         "Field 'device' (search query or device object) is required to create a component."
       );
     }
+    if (typeof params.device !== "string") assertCatalogDeviceReference(params.device);
+    else if (!params.device.trim()) throw apiError("invalid_params", "Device search query must not be empty.");
     if (!isNumber(params.x) || !isNumber(params.y)) {
       throw apiError("invalid_params", "Numeric coordinates 'x' and 'y' are required to place a component.");
     }
@@ -108,6 +144,12 @@ export async function prepareSchematicComponentMutation(
     const designator = params.designator ? String(params.designator).trim() : undefined;
     const rotation = isNumber(params.rotation) ? Number(params.rotation) : 0;
     const mirror = Boolean(params.mirror);
+    if (
+      params.uniqueId !== undefined &&
+      (typeof params.uniqueId !== "string" || !params.uniqueId.trim() || params.uniqueId !== params.uniqueId.trim())
+    )
+      throw apiError("invalid_params", "uniqueId must be a nonempty string without surrounding whitespace.");
+    const uniqueId = params.uniqueId as string | undefined;
 
     const operation = {
       action: "createComponent",
@@ -115,6 +157,7 @@ export async function prepareSchematicComponentMutation(
       x,
       y,
       designator,
+      uniqueId,
       subPartName: params.subPartName ? String(params.subPartName) : undefined,
       rotation,
       mirror,
@@ -134,10 +177,17 @@ export async function prepareSchematicComponentMutation(
         x,
         y,
         designator,
+        ...(uniqueId !== undefined ? { uniqueId } : {}),
         rotation,
         mirror
       },
-      changedKeys: ["device", "x", "y", ...(designator ? ["designator"] : [])],
+      changedKeys: [
+        "device",
+        "x",
+        "y",
+        ...(designator ? ["designator"] : []),
+        ...(uniqueId !== undefined ? ["uniqueId"] : [])
+      ],
       scope: `document:${currentTarget.documentId ?? "active"}`,
       impact: `Creates new component at (${x}, ${y}) with device "${typeof params.device === "string" ? params.device : "custom"}"${designator ? ` designator ${designator}` : ""}.`
     };
@@ -385,10 +435,14 @@ export async function executeSchematicComponentMutation(
   const op = record.operation as Record<string, any>;
 
   if (op.action === "assignPinNets") return executePinNets(record, api);
+  if (op.action === "annotateSchematic") return executeSchematicAnnotation(record, api);
+  if (op.action === "layoutSchematic") return executeSchematicLayout(record, api);
+  if (op.action === "layoutSchematicAttributes") return executeSchematicAttributeLayout(record, api);
 
   if (op.action === "createComponent") {
     ensureApi("sch_PrimitiveComponent", "create", eda);
 
+    if (op.uniqueId !== undefined) ensureApi("sch_PrimitiveComponent", "modify", eda);
     let deviceObj: unknown = op.device;
     if (typeof op.device === "string") {
       const searchFn = eda.lib_Device?.search ?? eda.lib_Search?.search;
@@ -402,6 +456,8 @@ export async function executeSchematicComponentMutation(
       deviceObj = searchResult[0];
     }
 
+    // Recheck legacy prepared records and search results before the non-cancellable SDK create RPC.
+    assertCatalogDeviceReference(deviceObj);
     const comp = await eda.sch_PrimitiveComponent.create(
       deviceObj,
       op.x,
@@ -421,50 +477,94 @@ export async function executeSchematicComponentMutation(
       (typeof comp === "string" ? comp : undefined);
 
     if (!createdPrimitiveId) {
-      throw apiError("creation_failed", "Component create call completed without returning a valid primitive ID.");
-    }
-
-    if (op.designator && eda.sch_PrimitiveComponent.modify) {
-      await eda.sch_PrimitiveComponent.modify(createdPrimitiveId, { designator: op.designator });
-    }
-
-    // Readback verification
-    let readbackComp: ResolvedComponent | undefined;
-    try {
-      readbackComp = await findComponentInSchematic(api, createdPrimitiveId);
-    } catch {
-      // If findComponentInSchematic doesn't find it yet, check eda.sch_PrimitiveComponent.get
-      if (eda.sch_PrimitiveComponent.get) {
-        const raw = await eda.sch_PrimitiveComponent.get(createdPrimitiveId);
-        if (raw) {
-          readbackComp = {
-            primitiveId: createdPrimitiveId,
-            designator: String(raw.designator ?? raw.name ?? op.designator ?? ""),
-            x: numeric(raw.x) ?? op.x,
-            y: numeric(raw.y) ?? op.y,
-            raw
-          };
-        }
-      }
-    }
-
-    if (!readbackComp) {
       throw apiError(
-        "readback_verification_failed",
-        `Component ${createdPrimitiveId} could not be verified on readback.`
+        "write_readback_unknown",
+        "Component create call completed without returning a valid primitive ID; do not recreate."
       );
     }
 
-    return {
-      executed: true,
-      readback: {
-        primitiveId: readbackComp.primitiveId,
-        designator: readbackComp.designator,
-        x: readbackComp.x,
-        y: readbackComp.y,
-        verified: true
+    try {
+      if (op.uniqueId !== undefined && extensionMutations.get(record.mutationId).status !== "running")
+        throw apiError(
+          "write_readback_unknown",
+          `Component ${createdPrimitiveId} created after mutation deadline; no modify dispatched.`
+        );
+      if ((op.designator || op.uniqueId !== undefined) && eda.sch_PrimitiveComponent.modify) {
+        if (op.uniqueId !== undefined) {
+          assertDocumentTargetMatch(
+            record.target,
+            extractDocumentIdentity(await eda.dmt_SelectControl.getCurrentDocumentInfo())
+          );
+          if (extensionMutations.get(record.mutationId).status !== "running")
+            throw apiError(
+              "write_readback_unknown",
+              "Mutation expired before property assignment; no modify dispatched."
+            );
+        }
+        await eda.sch_PrimitiveComponent.modify(createdPrimitiveId, {
+          ...(op.designator ? { designator: op.designator } : {}),
+          ...(op.uniqueId !== undefined ? { uniqueId: op.uniqueId } : {})
+        });
       }
-    };
+    } catch (error) {
+      throw apiError(
+        "write_readback_unknown",
+        `Component ${createdPrimitiveId} was created; property assignment uncertain; do not recreate. ${String(error)}`
+      );
+    }
+
+    // Readback verification uses a fresh public getter, never the create/modify result.
+    try {
+      let readbackComp: ResolvedComponent | undefined;
+      try {
+        readbackComp = await findComponentInSchematic(api, createdPrimitiveId);
+      } catch {
+        // If findComponentInSchematic doesn't find it yet, check eda.sch_PrimitiveComponent.get
+        if (eda.sch_PrimitiveComponent.get) {
+          const raw = await eda.sch_PrimitiveComponent.get(createdPrimitiveId);
+          if (raw) {
+            readbackComp = {
+              primitiveId: createdPrimitiveId,
+              designator: String(raw.designator ?? raw.name ?? op.designator ?? ""),
+              x: numeric(raw.x) ?? op.x,
+              y: numeric(raw.y) ?? op.y,
+              raw
+            };
+          }
+        }
+      }
+
+      if (!readbackComp) {
+        throw apiError("write_readback_unknown", `Component ${createdPrimitiveId} could not be verified on readback.`);
+      }
+
+      const observedUniqueId =
+        typeof readbackComp.raw.getState_UniqueId === "function"
+          ? readbackComp.raw.getState_UniqueId()
+          : readbackComp.raw.uniqueId;
+      if (op.uniqueId !== undefined && observedUniqueId !== op.uniqueId)
+        throw apiError(
+          "write_readback_unknown",
+          `Created component ${createdPrimitiveId} uniqueId readback mismatch; do not recreate.`
+        );
+
+      return {
+        executed: true,
+        readback: {
+          ...(op.uniqueId !== undefined ? { uniqueId: observedUniqueId } : {}),
+          primitiveId: readbackComp.primitiveId,
+          designator: readbackComp.designator,
+          x: readbackComp.x,
+          y: readbackComp.y,
+          verified: true
+        }
+      };
+    } catch (error) {
+      throw apiError(
+        "write_readback_unknown",
+        `Created component ${createdPrimitiveId} could not be independently verified; do not recreate. ${String(error)}`
+      );
+    }
   }
 
   if (op.action === "moveComponent") {

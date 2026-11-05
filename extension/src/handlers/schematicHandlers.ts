@@ -1,5 +1,6 @@
+import { getSchematicAnnotationInventory } from "../mutation/schematicLayout.js";
 import { collectSchematicMembership } from "./schematicConnectivity.js";
-import { collectNativeNetlist } from "./nativeNetlist.js";
+import { collectNativeNetlist, validateNativeNetlistTimeoutMs } from "./nativeNetlist.js";
 import {
   assertSnapshotFresh,
   buildSchematicSnapshot,
@@ -17,6 +18,7 @@ import { assertDocumentTargetMatch, extractDocumentIdentity, type DocumentIdenti
 import {
   apiError,
   ensureApi,
+  isRecord,
   optionalCall,
   sanitize,
   simplifyPrimitive,
@@ -34,8 +36,14 @@ export async function getSchematicComponents(api: () => EasyEdaApi): Promise<unk
 
 export async function collectSchematicSnapshot(
   api: () => EasyEdaApi,
-  options: { includeRaw: boolean; allPages: boolean; expectedTarget?: Partial<DocumentIdentity> }
+  options: {
+    includeRaw: boolean;
+    allPages: boolean;
+    expectedTarget?: Partial<DocumentIdentity>;
+    nativeNetlistTimeoutMs?: number;
+  }
 ): Promise<SchematicSnapshot> {
+  const nativeNetlistTimeoutMs = validateNativeNetlistTimeoutMs(options.nativeNetlistTimeoutMs);
   const eda = api();
   const documentInfo = await optionalCall(() => eda.dmt_SelectControl?.getCurrentDocumentInfo?.());
   const target = extractDocumentIdentity(documentInfo, undefined, "native_api");
@@ -45,7 +53,7 @@ export async function collectSchematicSnapshot(
   }
 
   if (options.allPages && eda.dmt_Schematic?.getCurrentSchematicAllSchematicPagesInfo) {
-    const data = await collectSchematicMembership(api, { target });
+    const data = await collectSchematicMembership(api, { target, nativeNetlistTimeoutMs });
     const snapshot = buildSchematicSnapshot({
       target,
       source: "native_api",
@@ -60,10 +68,19 @@ export async function collectSchematicSnapshot(
     snapshot.warnings.push(
       "Multi-page geometry is intentionally omitted: page-local coordinates must not be electrically merged. Use single-page snapshots for wires and annotations."
     );
+    if (data.native.status !== "available")
+      snapshot.warnings.push(
+        "Native connectivity was not obtained. Multi-page geometry is omitted; zero nets and unknown pins do not prove an empty or disconnected circuit."
+      );
     return snapshot;
   }
+  if (options.allPages)
+    throw apiError(
+      "scope_unsupported",
+      "All-pages snapshots require the public current-schematic page iterator; project-global getAll(true) is not a safe substitute. Use allPages:false for an explicitly active page."
+    );
   ensureApi("sch_PrimitiveComponent", "getAll", eda);
-  const components = toArray(await eda.sch_PrimitiveComponent.getAll(undefined, options.allPages));
+  const components = toArray(await eda.sch_PrimitiveComponent.getAll(undefined, false));
   const pinsByComponent: Record<string, unknown[]> = {};
 
   if (eda.sch_PrimitiveComponent?.getAllPinsByPrimitiveId) {
@@ -87,7 +104,7 @@ export async function collectSchematicSnapshot(
     wires: await optionalCall(() => (eda.sch_PrimitiveWire?.getAll ? eda.sch_PrimitiveWire.getAll() : [])),
     texts: await optionalCall(() => (eda.sch_PrimitiveText?.getAll ? eda.sch_PrimitiveText.getAll() : [])),
     includeRaw: options.includeRaw,
-    nativeNetlist: await collectNativeNetlist(eda, options.allPages)
+    nativeNetlist: await collectNativeNetlist(eda, options.allPages, nativeNetlistTimeoutMs)
   };
   const afterInfo = await eda.dmt_SelectControl.getCurrentDocumentInfo();
   assertDocumentTargetMatch(target, extractDocumentIdentity(afterInfo, undefined, "native_api"));
@@ -114,7 +131,8 @@ export function createSchematicHandlers(api: () => EasyEdaApi): Record<string, R
     const fresh = await collectSchematicSnapshot(api, {
       includeRaw: params.includeRaw ?? includeRawDefault,
       allPages: params.allPages !== false,
-      expectedTarget: params.expectedTarget
+      expectedTarget: params.expectedTarget,
+      nativeNetlistTimeoutMs: params.nativeNetlistTimeoutMs
     });
     cachedSnapshot = fresh;
     return fresh;
@@ -462,61 +480,98 @@ export function createSchematicHandlers(api: () => EasyEdaApi): Record<string, R
     const startedAt = Date.now();
     let rawResult: unknown;
     try {
-      rawResult = await eda.sch_Drc.check(strict, false, true);
+      rawResult = await eda.sch_Drc.check(strict, params.showResults === true, true);
     } catch {
-      rawResult = await eda.sch_Drc.check(strict);
+      rawResult = await eda.sch_Drc.check(strict, params.showResults === true);
     }
     const durationMs = Date.now() - startedAt;
 
-    let violations: unknown[] = [];
-    let passed: boolean;
+    const violations: unknown[] = [];
+    let explicitPassed: boolean | undefined;
     let errorsCount = 0;
     let warningsCount = 0;
+    let detailsComplete = true;
+    let inconclusive = false;
     const warnings: string[] = [];
-    let status: "passed" | "violations_found" | "inconclusive";
-
+    const consume = (items: unknown[], defaultSeverity: "error" | "warning" = "error") => {
+      for (const item of items) {
+        const rec = isRecord(item) ? item : undefined;
+        const severity = String(rec?.severity ?? rec?.level ?? rec?.type ?? defaultSeverity).toLowerCase();
+        const isWarning = ["warning", "warn"].includes(severity);
+        const hasDetails =
+          rec &&
+          ["message", "desc", "description", "text", "primitiveId", "primitiveIds", "rule", "ruleCode", "code"].some(
+            (key) => rec[key] !== undefined
+          );
+        if (rec && rec.count !== undefined && !hasDetails) {
+          detailsComplete = false;
+          if (
+            !Number.isSafeInteger(rec.count) ||
+            Number(rec.count) < 0 ||
+            !["error", "warn", "warning"].includes(severity)
+          ) {
+            inconclusive = true;
+            warnings.push("Native ERC returned an unsupported aggregate count.");
+            continue;
+          }
+          if (isWarning) warningsCount += Number(rec.count);
+          else errorsCount += Number(rec.count);
+          continue;
+        }
+        if (isWarning) warningsCount++;
+        else errorsCount++;
+        violations.push(
+          rec
+            ? { ...rec, severity: isWarning ? "warning" : "error" }
+            : {
+                message: String(item),
+                severity: defaultSeverity
+              }
+        );
+      }
+    };
     if (Array.isArray(rawResult)) {
-      violations = rawResult;
-      errorsCount = rawResult.length;
-      passed = errorsCount === 0;
-      status = passed ? "passed" : "violations_found";
-    } else if (rawResult && typeof rawResult === "object") {
-      const rawObj = rawResult as Record<string, any>;
-      if (Array.isArray(rawObj.errors)) {
-        errorsCount = rawObj.errors.length;
-        violations = violations.concat(rawObj.errors);
+      consume(rawResult);
+    } else if (isRecord(rawResult)) {
+      if (Array.isArray(rawResult.violations)) consume(rawResult.violations);
+      else {
+        if (Array.isArray(rawResult.errors)) consume(rawResult.errors);
+        if (Array.isArray(rawResult.warnings)) consume(rawResult.warnings, "warning");
       }
-      if (Array.isArray(rawObj.warnings)) {
-        warningsCount = rawObj.warnings.length;
-        violations = violations.concat(rawObj.warnings);
+      explicitPassed =
+        typeof rawResult.passed === "boolean"
+          ? rawResult.passed
+          : typeof rawResult.success === "boolean"
+            ? rawResult.success
+            : undefined;
+      if (
+        !Array.isArray(rawResult.violations) &&
+        !Array.isArray(rawResult.errors) &&
+        !Array.isArray(rawResult.warnings) &&
+        explicitPassed === undefined
+      ) {
+        inconclusive = true;
+        detailsComplete = false;
       }
-      if (Array.isArray(rawObj.violations)) {
-        violations = rawObj.violations;
-        errorsCount = violations.length;
-      }
-      if (typeof rawObj.passed === "boolean") {
-        passed = rawObj.passed;
-      } else if (typeof rawObj.success === "boolean") {
-        passed = rawObj.success;
-      } else {
-        passed = errorsCount === 0;
-      }
-      status = passed ? "passed" : "violations_found";
     } else if (typeof rawResult === "boolean") {
-      passed = rawResult;
-      errorsCount = rawResult ? 0 : 1;
-      status = passed ? "passed" : "violations_found";
-      if (!passed) {
-        violations.push({
-          message: "Native schematic ERC failed without detailed violation records.",
-          severity: "error"
-        });
+      explicitPassed = rawResult;
+      if (!rawResult) {
+        detailsComplete = false;
+        consume([{ message: "Native schematic ERC failed without detailed violation records.", severity: "error" }]);
       }
     } else {
-      status = "inconclusive";
-      passed = false;
+      inconclusive = true;
+      detailsComplete = false;
       warnings.push("Native ERC returned unparseable or inconclusive result.");
     }
+    if (!detailsComplete && !inconclusive && Array.isArray(rawResult))
+      warnings.push("Native ERC returned aggregate counts; individual violation details are unavailable.");
+    const passed = !inconclusive && errorsCount === 0 && explicitPassed !== false;
+    const status = inconclusive
+      ? "inconclusive"
+      : errorsCount + warningsCount > 0 || !passed
+        ? "violations_found"
+        : "passed";
 
     const formattedViolations = violations.map((v) => {
       if (typeof v === "string") {
@@ -551,7 +606,8 @@ export function createSchematicHandlers(api: () => EasyEdaApi): Record<string, R
       target: currentTarget,
       capturedAt: currentTarget.capturedAt,
       passed,
-      violationsCount: formattedViolations.length,
+      violationsCount: errorsCount + warningsCount,
+      detailsComplete,
       errorsCount,
       warningsCount,
       violations: formattedViolations,
@@ -563,6 +619,7 @@ export function createSchematicHandlers(api: () => EasyEdaApi): Record<string, R
   }
 
   return {
+    getSchematicAnnotationInventory: (params) => getSchematicAnnotationInventory(api, params),
     schematicSnapshot,
     listSchematicComponents: listSchematicComponentsTool,
     listSchematicComponentsTool,

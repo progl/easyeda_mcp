@@ -1,6 +1,7 @@
 import { apiError, inferDocumentType, isRecord, optionalCall, sanitize, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity, type DocumentIdentity } from "../identity.js";
 import type { EasyEdaApi, RpcHandler } from "../types.js";
+import { extensionMutations } from "../mutation/mutationManager.js";
 
 export type NormalizedDocumentItem = {
   documentId: string;
@@ -39,7 +40,7 @@ export function collectTabsFromTree(node: unknown, splitScreenId?: string): Open
           tabId,
           documentUuid,
           title: typeof tab.title === "string" ? tab.title : typeof tab.name === "string" ? tab.name : undefined,
-          documentType: tab.documentType,
+          documentType: tab.documentType ?? (isRecord(tab.data) ? tab.data.doctype : undefined),
           splitScreenId: currentSplitId
         });
       }
@@ -341,9 +342,181 @@ export function createDocumentHandlers(api: () => EasyEdaApi): Record<string, Rp
     };
   }
 
+  let refreshRunning = false;
+  async function refreshDocumentView(params: Record<string, any>): Promise<Record<string, unknown>> {
+    const expected = params.target;
+    if (
+      !isRecord(expected) ||
+      typeof expected.projectId !== "string" ||
+      !expected.projectId ||
+      typeof expected.documentId !== "string" ||
+      !expected.documentId ||
+      !["schematic", "pcb"].includes(String(expected.documentType))
+    )
+      throw apiError(
+        "invalid_params",
+        "Refresh requires explicit projectId, documentId and schematic/pcb documentType."
+      );
+    const timeoutMs = params.timeoutMs ?? 30000;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 200 || timeoutMs > 120000)
+      throw apiError("invalid_params", "timeoutMs must be 200–120000 ms.");
+    if (refreshRunning || extensionMutations.getExecutionState().lockHeld)
+      throw apiError("editor_busy", "Do not refresh while a mutation or another refresh is running.");
+    refreshRunning = true;
+    const eda = api(),
+      control = eda.dmt_EditorControl,
+      saveOwner = expected.documentType === "schematic" ? eda.sch_Document : eda.pcb_Document;
+    let phase = "preflight",
+      closeRequested = false,
+      oldTabRemoved = false,
+      saveVerified = false;
+    const deadline = Date.now() + timeoutMs - Math.min(500, timeoutMs / 10);
+    const bounded = async <T>(call: () => Promise<T> | T): Promise<T> => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw apiError("refresh_timeout", "Document refresh deadline expired.");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          Promise.resolve().then(call),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(apiError("refresh_timeout", "Native document refresh call timed out; do not replay.")),
+              remaining
+            );
+          })
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const identity = async () =>
+      extractDocumentIdentity(await bounded(() => eda.dmt_SelectControl.getCurrentDocumentInfo()));
+    const guard = async () => {
+      if (extensionMutations.getExecutionState().lockHeld)
+        throw apiError("editor_busy", "A mutation began during refresh; stopped.");
+      assertDocumentTargetMatch(expected, await identity());
+    };
+    const projectGuard = async () => {
+      const info: any = await bounded(() => eda.dmt_Project.getCurrentProjectInfo());
+      if (String(info?.uuid ?? info?.projectId ?? "") !== expected.projectId)
+        throw apiError("target_mismatch", "Active project changed during refresh.");
+    };
+    const readTabs = async () => {
+      const tree = await bounded(() => control.getSplitScreenTree());
+      if (
+        !isRecord(tree) ||
+        typeof tree.id !== "string" ||
+        (!Array.isArray(tree.tabs) && !Array.isArray(tree.children))
+      )
+        throw apiError(
+          "unverified_tab_inventory",
+          "Native split-screen tree did not provide a verifiable tab inventory."
+        );
+      return collectTabsFromTree(tree);
+    };
+    try {
+      for (const [owner, method] of [
+        [control, "getSplitScreenTree"],
+        [control, "closeDocument"],
+        [control, "openDocument"],
+        [saveOwner, "save"],
+        [eda.dmt_Project, "getCurrentProjectInfo"],
+        [eda.dmt_SelectControl, "getCurrentDocumentInfo"]
+      ] as Array<[any, string]>)
+        if (typeof owner?.[method] !== "function")
+          throw apiError("capability_unavailable", `Refresh requires public ${method}; no close attempted.`);
+      await guard();
+      await projectGuard();
+      const before = await identity(),
+        tabs = await readTabs();
+      // Public IDMT_EditorTabItem carries tabId, not documentUuid. Bind that
+      // inventory entry to the independently read current document identity.
+      const activeTabId = before.tabId ?? expected.tabId;
+      const matches = tabs.filter((t) =>
+        t.documentUuid ? t.documentUuid === expected.documentId : Boolean(activeTabId && t.tabId === activeTabId)
+      );
+      if (matches.length !== 1)
+        throw apiError("ambiguous_tab", "Expected document must have exactly one open tab before refreshing.");
+      const oldTab = matches[0];
+      if (before.tabId && oldTab.tabId !== before.tabId)
+        throw apiError("target_mismatch", "Active tab does not match native tab inventory.");
+      phase = "save";
+      await guard();
+      if ((await bounded(() => saveOwner.save())) !== true)
+        throw apiError("save_unconfirmed", "Native save did not return true; document was never closed.");
+      saveVerified = true;
+      phase = "close";
+      await guard();
+      await projectGuard();
+      closeRequested = true;
+      if ((await bounded(() => control.closeDocument(oldTab.tabId))) !== true)
+        throw new Error("Native close did not return true; inspect tabs before recovery.");
+      phase = "wait_closed";
+      while (true) {
+        await projectGuard();
+        const current = await readTabs();
+        if (!current.some((t) => t.tabId === oldTab.tabId || t.documentUuid === expected.documentId)) {
+          oldTabRemoved = true;
+          break;
+        }
+        if (Date.now() >= deadline) throw new Error("Old tab removal was not confirmed.");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      phase = "open";
+      await projectGuard();
+      if (extensionMutations.getExecutionState().lockHeld)
+        throw apiError("editor_busy", "A mutation began after close; automatic reopen stopped.");
+      const newTabId = await bounded(() => control.openDocument(expected.documentId, oldTab.splitScreenId));
+      if (typeof newTabId !== "string" || !newTabId) throw new Error("Native reopen did not return a tab ID.");
+      phase = "verify";
+      while (true) {
+        await projectGuard();
+        const current = await identity(),
+          currentTabs = await readTabs();
+        if (
+          current.projectId === expected.projectId &&
+          current.documentId === expected.documentId &&
+          current.documentType === expected.documentType &&
+          current.tabId === newTabId &&
+          currentTabs.some((t) => (!t.documentUuid || t.documentUuid === expected.documentId) && t.tabId === newTabId)
+        )
+          return {
+            status: "refreshed",
+            saveVerified: true,
+            oldTabRemoved: true,
+            targetVerified: true,
+            visualRenderVerified: false,
+            previousTabId: oldTab.tabId,
+            tabId: newTabId,
+            target: current,
+            refreshMethod: "public_save_close_poll_open",
+            note: "Reopened saved document; rendered canvas must be checked separately."
+          };
+        if (Date.now() >= deadline) throw new Error("Reopened document target was not verified.");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    } catch (error) {
+      if (!closeRequested) throw error;
+      return {
+        status: "unknown",
+        retryable: false,
+        phase,
+        saveVerified,
+        closeRequested,
+        oldTabRemoved,
+        visualRenderVerified: false,
+        error: String(error).slice(0, 600),
+        nextSteps: ["Inspect document tabs/current target before recovery. Never automatically repeat save/close/open."]
+      };
+    } finally {
+      refreshRunning = false;
+    }
+  }
+
   return {
     listDocuments,
     openDocument,
-    renderDocumentView
+    renderDocumentView,
+    refreshDocumentView
   };
 }

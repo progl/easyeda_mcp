@@ -1,3 +1,4 @@
+import { prepareScopedPcbSync, executeScopedPcbSync } from "./schematicPcbSyncGuards.js";
 import { apiError, isRecord, numeric, optionalCall, stringOrUndefined, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity, type DocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
@@ -472,6 +473,8 @@ export async function prepareSchematicPcbSyncMutation(
     canonicalAction = "createPcbFromSchematic";
   }
 
+  if (canonicalAction === "syncToPcb") return prepareScopedPcbSync(api, params);
+
   // Run before comparison
   const beforeComparison = await compareSchematicPcb(api, params);
 
@@ -495,19 +498,6 @@ export async function prepareSchematicPcbSyncMutation(
 
     impact = `Creates new PCB board '${boardName}' (${layerCount} copper layers, ${width}x${height}mm) populated with ${beforeComparison.summary.schematicComponentCount} components and ${beforeComparison.summary.schematicNetCount} nets from the active schematic.`;
     scope = `schematic:${beforeComparison.schematicTarget?.documentId ?? "active"}`;
-  } else if (canonicalAction === "syncToPcb") {
-    operation = {
-      action: "syncToPcb",
-      unplacedComponents: beforeComparison.components
-        .filter((c) => c.status === "schematic_only")
-        .map((c) => c.designator),
-      unroutedNets: beforeComparison.nets.filter((n) => n.status === "schematic_only").map((n) => n.name)
-    };
-
-    const compCount = beforeComparison.summary.unplacedComponentCount;
-    const netCount = beforeComparison.summary.unroutedSchematicNetCount;
-    impact = `Synchronizes schematic to PCB: pushes ${compCount} unplaced component(s) and ${netCount} net(s) to the PCB document.`;
-    scope = `pcb:${beforeComparison.pcbTarget?.documentId ?? "active"}`;
   } else {
     // syncToSchematic
     operation = {
@@ -606,35 +596,7 @@ export async function executeSchematicPcbSyncMutation(
     };
   }
 
-  if (op.action === "syncToPcb") {
-    let syncResult: unknown;
-    if (eda.pcb_Document?.importChanges) {
-      syncResult = await eda.pcb_Document.importChanges();
-    } else if (eda.sch_Document?.updatePcb) {
-      syncResult = await eda.sch_Document.updatePcb();
-    } else if (eda.dmt_Document?.importChanges) {
-      syncResult = await eda.dmt_Document.importChanges();
-    } else {
-      throw apiError(
-        "capability_unavailable",
-        "Schematic to PCB sync (pcb_Document.importChanges / sch_Document.updatePcb) is not available in the connected EasyEDA Pro version."
-      );
-    }
-
-    const afterComparison = await compareSchematicPcb(api);
-
-    return {
-      executed: true,
-      readback: {
-        action: op.action,
-        syncResult,
-        afterSyncStatus: afterComparison.syncStatus,
-        afterSyncScore: afterComparison.syncScore,
-        remainingDiscrepancies: afterComparison.summary.totalDiscrepancies,
-        verified: true
-      }
-    };
-  }
+  if (op.action === "syncToPcb") return executeScopedPcbSync(record, api);
 
   if (op.action === "syncToSchematic") {
     let backAnnotateResult: unknown;

@@ -78,6 +78,20 @@ export const ConnectionCheckSchema = z.discriminatedUnion("type", [
 
 export function registerSchematicTools(server: McpServer, bridge: EditorClient): void {
   registerReadTool(server, bridge, {
+    name: "easyeda_get_schematic_annotation_inventory",
+    title: "Read current-page free text and rectangle IDs/styles",
+    description:
+      "Read-only free TEXT/rectangle inventory with public getters. Requires explicit current schematic page/project target, expectedBoardName and a distinct protectedBoardName. No edit preparation, CAD writes, document navigation or persistence claim. Use fresh IDs after reloading a page before explicit annotation changes.",
+    method: "getSchematicAnnotationInventory",
+    inputSchema: {
+      target: DocumentTargetSchema,
+      expectedBoardName: z.string().min(1).max(200),
+      protectedBoardName: z.string().min(1).max(200),
+      timeoutMs: DefaultTimeoutSchema.default(30000)
+    },
+    summary: "Read exact current-page free annotation IDs and full native style without writing."
+  });
+  registerReadTool(server, bridge, {
     name: "easyeda_find_component",
     title: "Find EasyEDA Pro component",
     description:
@@ -118,6 +132,15 @@ export function registerSchematicTools(server: McpServer, bridge: EditorClient):
           "Include compact raw EasyEDA API data for fallback reasoning. Defaults to false to minimize token consumption."
         ),
       allPages: z.boolean().default(true).describe("Collect all schematic pages when EasyEDA Pro exposes them."),
+      nativeNetlistTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .max(20000)
+        .default(3000)
+        .describe(
+          "Native netlist export/read budget, separate from transport timeoutMs. Up to 20000 ms for large schematics. Set timeoutMs to cover page collection plus this budget."
+        ),
       timeoutMs: DefaultTimeoutSchema.default(30_000)
     },
     summary: "Fetched EasyEDA Pro schematic snapshot."
@@ -228,6 +251,12 @@ export function registerSchematicTools(server: McpServer, bridge: EditorClient):
     method: "runSchematicErc",
     inputSchema: {
       strict: z.boolean().default(true).describe("Enforce strict electrical rule checking."),
+      showResults: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Show the native bottom ERC/DRC results panel. Does not change violation counts or guarantee individual API details."
+        ),
       target: DocumentTargetSchema.optional().describe("Expected active schematic target."),
       timeoutMs: DefaultTimeoutSchema.default(60_000)
     },

@@ -5,6 +5,86 @@ import { Client } from "@modelcontextprotocol/client";
 import { registerPcbTools } from "./pcbTools.js";
 
 describe("pcbTools", () => {
+  it("exposes native create pourPriority as a positive integer and forwards it unchanged", async () => {
+    const bridge: any = { call: vi.fn(async () => ({ mutationId: "m", confirmation: "confirm" })) };
+    const server = new McpServer({ name: "test", version: "1" });
+    registerPcbTools(server, bridge);
+    const client = new Client({ name: "test", version: "1" });
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(s), client.connect(c)]);
+    try {
+      const args = { entity: "copperZone", action: "create", net: "VM", pourPriority: 10 };
+      expect((await client.callTool({ name: "easyeda_prepare_copper_keepout", arguments: args })).isError).toBeFalsy();
+      expect(bridge.call).toHaveBeenCalledWith(
+        "prepareCopperKeepout",
+        expect.objectContaining({ pourPriority: 10 }),
+        30000
+      );
+      for (const value of [0, 1.5])
+        expect(
+          (
+            await client.callTool({
+              name: "easyeda_prepare_copper_keepout",
+              arguments: { ...args, pourPriority: value }
+            })
+          ).isError
+        ).toBeTruthy();
+      expect(bridge.call).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+  it("allows explicit track/via inventory limit2000 through the MCP schema", async () => {
+    const bridge: any = { call: vi.fn(async () => ({ tracks: [], vias: [] })) };
+    const server = new McpServer({ name: "test", version: "1" });
+    registerPcbTools(server, bridge);
+    const client = new Client({ name: "test", version: "1" });
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(s), client.connect(c)]);
+    try {
+      for (const [name, method] of [
+        ["easyeda_get_pcb_tracks", "getPcbTracks"],
+        ["easyeda_get_pcb_vias", "getPcbVias"]
+      ]) {
+        expect((await client.callTool({ name, arguments: { limit: 2000 } })).isError).toBeFalsy();
+        expect(bridge.call).toHaveBeenCalledWith(method, expect.objectContaining({ limit: 2000 }), 30000);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+  it("preserves explicit mm units on component, track and create-only outline requests", async () => {
+    const bridge: any = {
+      endpoint: "local",
+      getStatus: () => ({ connected: true }),
+      call: vi.fn(async () => ({ mutationId: "m", confirmation: "confirm" }))
+    };
+    const server = new McpServer({ name: "test", version: "1" });
+    registerPcbTools(server, bridge);
+    const client = new Client({ name: "test", version: "1" });
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(s), client.connect(c)]);
+    try {
+      for (const [name, method, args] of [
+        ["easyeda_prepare_pcb_component", "preparePcbComponent", { action: "move", component: "U1", x: 25.4 }],
+        [
+          "easyeda_prepare_pcb_track_via",
+          "preparePcbTrackVia",
+          { entity: "track", action: "create", net: "GND", startX: 0, startY: 0, endX: 25.4, endY: 0 }
+        ],
+        ["easyeda_prepare_board_outline", "prepareBoardOutline", { action: "create", width: 25.4, height: 12.7 }],
+        ["easyeda_prepare_mounting_holes", "prepareMountingHoles", { holes: [{ x: 3.5, y: 3.5, diameter: 3.2 }] }]
+      ] as const) {
+        expect((await client.callTool({ name, arguments: { ...args, units: "mm" } })).isError).toBeFalsy();
+        expect(bridge.call).toHaveBeenCalledWith(method, expect.objectContaining({ units: "mm" }), 30000);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
   it("registers all PCB inspection and DRC tools", () => {
     const server = new McpServer({ name: "test", version: "1.0.0" });
     const registerToolSpy = vi.spyOn(server, "registerTool");
@@ -18,6 +98,8 @@ describe("pcbTools", () => {
 
     const registeredToolNames = registerToolSpy.mock.calls.map((call) => call[0]);
     expect(registeredToolNames).toEqual([
+      "easyeda_reconcile_explicit_unroute",
+      "easyeda_prepare_mounting_holes",
       "easyeda_run_drc",
       "easyeda_get_pcb_layers",
       "easyeda_get_routing_status",

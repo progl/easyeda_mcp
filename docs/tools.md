@@ -268,28 +268,39 @@ Queries the status, readback evidence, and verification of any prepared or appli
 Builds a normalized snapshot of the active schematic: components, pins, wires, labels, nets, counts, `warnings`, and `confidence` (`high` | `partial` | `low`).
 
 **Parameters:**
-- **`includeRaw`** (`boolean`, _optional_, default: `true`): Include compact raw EasyEDA API payloads for fallback reasoning.
+- **`includeRaw`** (`boolean`, _optional_, default: `false`): Include compact raw EasyEDA API payloads for fallback reasoning.
 - **`allPages`** (`boolean`, _optional_, default: `true`): Collect across all schematic pages when exposed by EasyEDA Pro.
-- **`timeoutMs`** (`number`, _optional_, default: `30000`): RPC timeout in ms.
+- **`nativeNetlistTimeoutMs`** (`integer`, _optional_, `1`–`20000`, default: `3000`): Native export/read budget. Independent of RPC timeout.
+- **`timeoutMs`** (`number`, _optional_, default: `30000`): RPC timeout in ms; must cover page collection plus the native read budget.
 
 ---
 
-**Native connectivity:** with `allPages: false`, the extension attempts
-`sch_ManufactureData.getNetlistFile("mcp-native-connectivity", "Protel2")` and reads the returned
-File in memory. It does not save an export or modify the schematic. The read has a 3-second budget
-and a 2 MB limit. Only supported Protel2 component and net records are parsed.
+**Native connectivity:** the extension attempts Protel2 export, then supported EasyEDA JSON
+export if Protel2 is unavailable or unsupported. It reads the returned File in memory without
+saving an export or writing schematic primitives. The default native read budget is 3 seconds
+and the file limit is 2 MB. Mutation readback keeps its existing default; increasing this snapshot
+option does not increase mutation waits.
 
 The `nativeNetlist` result reports `status`, `format`, `matchedPins`, `conflicts`, and an optional
-`reason`. Pins matched by an exact, project-unique designator and pin number use
-`netSource: "native_netlist"`. Native membership takes precedence over geometric inference;
-disagreements produce warnings. Conflicting native memberships remain unknown.
+`reason`. Its `read` provenance reports `timeoutMs`, `durationMs`, `timedOut`, and
+`attemptedFormats`. An exact, project-unique designator/pin match uses
+`netSource: "native_netlist"`; absent members remain unknown rather than proving disconnection.
 
-An absent member does not prove disconnection: exports may omit components. Missing APIs,
-unsupported files, timeouts, duplicate designators, and unmatched pins retain explicit geometric
-fallback. Multi-page snapshots currently do not apply native membership because page-local IDs
-and duplicate references need a separate scoped reconciliation. This integration requires a real
-editor check after reloading the rebuilt extension; parsing tests alone do not establish export
-compatibility with every EasyEDA version.
+Multi-page snapshots namespace page-local IDs, collect native membership across pages, and
+restore the original active sheet. They intentionally omit geometric wires: matching page-local
+coordinates must not electrically join unrelated sheets. If native export times out, zero
+reported nets and unknown pins do **not** prove an empty or disconnected circuit. Inspect
+`nativeNetlist.status` and warnings before interpreting the counts.
+
+For a larger read-only audit, omit a cached `snapshotId` and request a fresh snapshot, for example:
+
+```json
+{"allPages": true, "nativeNetlistTimeoutMs": 15000, "timeoutMs": 60000}
+```
+
+The larger native budget still has a fixed 20-second maximum. Native export compatibility and
+actual elapsed time require verification in the connected editor; parsing tests alone do not
+establish compatibility with every EasyEDA version.
 
 ### `easyeda_get_schematic_nets`
 
@@ -706,17 +717,23 @@ Returns `mutationId`, exact confirmation token `CONFIRM pcb:<action> <mutationId
 
 Prepares native auto-routing or destructive unrouting of copper tracks and vias on the active PCB canvas. Supported actions:
 - `autoroute`: Routes traces natively for specified nets or all unrouted nets, preserving or rebuilding existing routes.
-- `unroute`: **Destructive operation** that clears and deletes routed tracks and vias for specified nets or across the entire board.
+- `unroute`: **Destructive operation** deleting only explicit `trackIds` / `viaIds` (1–5000 unique IDs total), in native batches of at most 250. Net-based implicit clearing is rejected.
 
 Returns `mutationId`, exact confirmation token `CONFIRM pcb:<action> <mutationId>`, and structured `preview` with baseline routing metrics, target scope, and expected changes. Previews expire after 5 minutes and require execution via `easyeda_confirmed_action`.
 
 **Parameters:**
 - **`action`** (`"autoroute" | "unroute"`, **required**): The routing operation to stage.
-- **`nets`** (`string[]`, _optional_): Explicit list of net names to route or unroute (e.g. `["GND", "VCC"]`). If omitted, targets all nets.
+- **`nets`** (`string[]`, _optional_): Explicit list of net names to autoroute (e.g. `["GND", "VCC"]`). If omitted, autorouting targets all nets.
 - **`ignoreNets`** (`string[]`, _optional_): List of net names to exclude from autorouting.
 - **`keepExistingRoutes`** (`boolean`, _optional_, default: `true`): Whether to preserve existing tracks during autorouting.
 - **`target`** (`object`, _optional_): Expected document target specification to assert against active canvas.
 - **`timeoutMs`** (`number`, _optional_, default: `30000`): RPC timeout in ms.
+
+---
+
+### `easyeda_reconcile_explicit_unroute`
+
+Read-only observation of a settled unknown explicit deletion. Inputs: `mutationId`, optional complete `originalRecord`, optional `timeoutMs`. Never deletes, retries, expands the original selection or resets a lock. Returns remaining original primitives and identifiable new primitives with native geometry; partial outcomes retain `unknown`. Old count-only receipts disclose unavailable preservation proof and unknown historical dispatch scope. New receipts retain full native before inventory internally with a compact preview and persist batch IDs/index, native pending/settle state and absence polling in `executionEvidence`. Only complete deletion plus exact protected native inventory can reconcile `applied`; new/rebuilt geometry requires separate explicit review.
 
 ---
 
@@ -1416,7 +1433,7 @@ are conservatively treated as pending writes until the entire executor settles.
 - `easyeda_list_schematic_pages({includeCounts?: boolean, target?, timeoutMs?})`: pages of the active schematic; optional part/wire counts, drawing format and component-anchor bounds. Counting temporarily opens pages and restores the original focus. The 150-part threshold is advisory.
 - `easyeda_prepare_schematic_page({action: "create"|"rename"|"format", pageId?, name?, format?: "A0"|"A1"|"A2"|"A3"|"A4", target?, timeoutMs?})`: exact prepared confirmation is required through `easyeda_confirmed_action`. Format changes drawing-frame properties; no page deletion is exposed. Save separately.
 - `easyeda_prepare_schematic_block_transfer({components: string[], destinationPageId: string, dx?: number, dy?: number, target?, timeoutMs?})`: 1–100 distinct component IDs/designators, offsets default to zero in native schematic units (10 mil). Transfers complete named wires physically attached to the selected parts, preserves unique IDs, part properties, footprint/symbol identity and attached attribute positions/styles. Rejects wires shared with unselected physical pins, unnamed wires, duplicate destination identities, destination pin/wire intersections and unsupported free labels/text/buses. Split large blocks into smaller operations to stay within execution timeouts.
-- `easyeda_audit_schematic_connectivity({target?, timeoutMs?})`: native membership for each page, namespaced local IDs, unknown pins and confirmed interpage nets. Temporarily opens pages and restores focus. Does not infer disconnection from absent netlist membership.
+- `easyeda_audit_schematic_connectivity({target?, nativeNetlistTimeoutMs?, timeoutMs?})`: native membership for each page, namespaced local IDs, unknown pins and confirmed interpage nets. Temporarily opens pages and restores focus. Does not infer disconnection from absent netlist membership.
 
 All four tools belong to the active schematic/project. Reads that activate pages are marked as affecting editor focus. Prepare tools do not write. Confirmed transfer is **not atomic**: it verifies copies before removing originals; failures include a journal and require inspection of both pages. Do not replay an unknown result. Custom library bindings or footprints that the SDK cannot reproduce cause readback failure and preserve source parts; copied parts may remain for inspection. Saving and final ERC/PCB verification remain separate.
 
@@ -1430,3 +1447,84 @@ Native connectivity first validates Protel2, then falls back to documented EasyE
 SDK references: [page management](https://prodocs.easyeda.com/en/api/reference/pro-api.dmt_schematic.html), [native JSON netlist specification](https://github.com/easyeda/easyeda-netlist-format/blob/main/easyeda-pro-netlist-format-en.md).
 
 In 0.5.4, project-local 16-character device IDs are resolved to an exact global library part by supplier ID, manufacturer part and footprint name before writes. Unresolvable parts are rejected. Page-name readback accepts the canonical lowercase names returned by EasyEDA.
+
+In 0.5.6, transfer reads annotation values through public SDK accessors (including font-unit conversion), stages copies under temporary identities, and hands off original designators/unique IDs only after copy verification. It refreshes native connectivity when available and retries read-only copy checks for up to 1.5 seconds to accommodate delayed wire-name publication. Writes are never repeated by this polling. A failure during identity handoff still requires journal inspection; transfer remains non-atomic.
+
+In 0.5.7, schematic frame formatting uses native dmt_Schematic.modifySchematicPageTitleBlock with Size when exposed; readback checks both size and dimensions. Rename and frame readback allow up to two seconds for native publication without repeating writes. An unverified result still requires inspection.
+
+In 0.5.8, frame verification and listing infer standard size from actual Width/Height within three native units. EasyEDA v3 can retain a stale custom Page Size attribute and rounds A2 to 2338×1652. This avoids reporting a failed write after the frame actually resized. Live resize must be independently verified and saved on each affected sheet.
+
+## Guarded scope, legacy replacement и native exports
+
+- В многоплатном проекте schematic snapshot использует подтверждённую область активной схемы. Повторяющиеся designators в разных boards допустимы; `getAll(true)` нельзя принимать за область одной схемы. Отсутствующий native pin net не означает NC: требуется явная пустая строка native map.
+- Для guarded `syncToPcb` обязательны `projectId`, `boardName`, `schematicUuid`, `pcbUuid`, `protectedBoardName`. До import независимо читаются SCH manifests физических компонентов/pin-net и PCB manifests компонентов/pads всех boards. Это выбранные поля, а не полные native snapshots: schematic UID/device/footprint/pins и PCB ID/UID/designator/footprint/placement/pad geometry/nets. Preview компактный (`beforeReference: "record.before"`); полный immutable набор этих manifests остаётся в `record.before`. After inventory использует `scoped_sync_inventory_delta_v1`: `targetPcbAfter` и ссылки на неизменные сравниваемые SCH/other-PCB manifests в before. `expandScopedPcbSyncInventory` без потерь восстанавливает только эти manifests. Сравнения выполняются по всем полям manifests, не по summary/counts. `otherBoardsComponentPadManifestPreserved` и `schematicPhysicalPinManifestPreserved` относятся только к этому охвату; `fullNativePreservation: false`. Дорожки, vias, copper areas, свободные PCB primitives, модели, OtherProperty, schematic graphics/annotations и нефизические детали не проверяются на сохранность. Лимит canonical JSON не увеличен.
+- `easyeda_prepare_schematic_legacy_recreate` работает без Source API: отдельные `stage` и `commit`, explicit project/document/expected board и обязательный `protectedBoardName`; Плата, явно указанная в `protectedBoardName`, защищена; имя не фиксировано глобально. Stage создаёт временную деталь из catalog device и возвращает реальные cached references. Commit требует applied stage и явно проверенный `expectedFootprint`. Между фазами нельзя менять CAD, делать PCB sync или обновлять runtime; stage journal действует в текущем runtime.
+- `wireStrategy: "preserve"` требует совпадения native pin-number/relative geometry. Явный `recreateNamedStubs` требует `stubWires: [{pinNumber, wireId}]`: один независимый named stub на pin, без branch/crossing/чужих pins. Preview показывает exact old IDs и новые линии; поддержаны горизонтальные native pin rotations 0/180. Создание новых stubs использует прочитанные после modify native pins и документированный positional `Wire.create`. Final proof сверяет весь native pin/net/NC map и kept contents.
+- `easyeda_reconcile_schematic_legacy_stage` и `easyeda_reconcile_schematic_create` только читают CAD и проверяют полный original receipt. Они не повторяют create/import/delete, не выполняют cleanup/rollback. Reconciled stage может честно иметь `geometryCompatible: false`; это не разрешение preserve commit. У существующей рамки `sheet` текущей страницы допускаются только служебные `OtherProperty.@Update Date` / `@Update Time`, с точными before/after diffs. Parts, остальные properties и protected-board state не нормализуются.
+- `easyeda_export_library_file` принимает `kind: device|footprint|symbol`, explicit `uuid`, `libraryUuid`, optional friendly `fileName`; формат — native `elibz2`. Используются только публичные `sys_FileManager.get*FileBy*Uuid` и `sys_FileSystem.saveFile` с исходными bytes реального File. Ответ содержит metadata (`nativeFileReceived`, размер, `saveRequested`, filename), без base64/mock JSON. `saved: null` при штатном void — отсутствие disk verification. ZIP framing не доказывает CRC, pin-pad mapping, модель или физическое mating; проверяйте скачанный архив отдельно. `lib_Device.get`/`lib_Footprint.get` metadata сами по себе не содержат pin/pad geometry; `pins: 0` из неполного adapter нельзя считать физическим отсутствием pins.
+- Post-write `unknown` не повторяется автоматически. Неотменяемый SDK promise удерживает lifecycle lock до settle; read-only polling не повторяет writes. `pendingWrites.bridgeLifecycle` в native preflight показывает observed lifecycle, включая bounded prepared IDs/count; это не глобальный native mutex. Неудачная сериализация prepare не оставляет зарегистрированную запись без выданного ID. Для compact-preview recovery требуется полный `record.before` и точное operation-specific summary; summary не заменяет proof.
+
+Ни один из этих результатов сам по себе не подтверждает routed copper connectivity, DRC, 3D geometry, PCB pad mapping после sync или производственную готовность.
+
+### Native import request и Apply
+
+В legacy EasyEDA `pcb_Document.importChanges()` может вернуть `true` после запуска асинхронного import dialog, до Apply. Поэтому confirmed sync возвращает `unknown` с `executionEvidence.awaitingNativeApply` / `targetManifestReady` и требует независимого reconcile; это не подтверждение открытого или закрытого UI. После native request выполняется только read текущего target PCB, без `openDocument` и переключений SCH/boards. Новый prepare/execute не навигирует документы при другом unresolved sync.
+
+`easyeda_reconcile_schematic_pcb_sync` сначала читает только уже активный target PCB. Пока полный component/UID/footprint/pad-net manifest не совпал с сохранённым source, результат `native_apply_pending`, без навигации или повторного import. Только после target match запускается независимая проверка сравниваемых component/pin/pad manifests всех boards; сохранность остальных native групп не установлена. В результате перечислены `otherBoardsUnverifiedGroups` и `schematicUnverifiedGroups`; ни `otherBoardsPreserved`, ни `schematicPreserved` не заявляются. Saved guarded unknown receipts 0.6.33 поддерживаются с полным original record; новый write не требуется. Public SDK не предоставляет подтверждённых show-existing/cancel/import-dialog-state методов: отсутствие Apply и закрытие старого UI нельзя доказать по одному unchanged PCB или `lockHeld:false`.
+
+
+### `easyeda_get_standalone_npth` / `easyeda_prepare_standalone_npth`
+
+Scoped native round non-plated mounting pads, independent of device/BOM components. Both require exact `projectId`, `pcbUuid`, `expectedBoardName`, and a separate existing `protectedBoardName` (use the original board name). The target PCB must already be active; these tools never navigate documents. Inventory returns native IDs and mm coordinates/diameter with unverified drill-export status.
+
+Prepare stages **exactly one** pad per confirmed mutation:
+
+- `action: "create"`, `x`, `y`, `diameter_mm` (explicit positive drill diameter; M3 clearance is not inferred).
+- `action: "move"`, `primitiveId`, `x`, `y` (keeps drill geometry/plating/layer/net).
+- `action: "delete"`, `primitiveId`.
+
+All inputs are mm. Only standalone native `Pad`, NORMAL=0, MULTI=12, empty net and pad number, round NPTH with zero annular ring and zero offsets qualify. Every physical component pad ID is excluded, even if native type metadata says Pad. Missing owner/geometry evidence fails closed. Exact confirm/target guards and full native before/after preserve components, physical pads/nets, unrelated pads, tracks/vias, copper pours/fills, keepouts and outline. Public instance `toAsync`/setters/`await done()` is used for move because bundled legacy Pad.modify returns before its internal write settles. Pending writes retain lifecycle lock; unknown never automatically retries or deletes a possible partial result. The execution journal records known native ID and pending/settled state. Only native getters are verified; root must independently export and check actual NPTH Excellon diameter/centers and PTH exclusion after create/move. `manufactureDrillVerified` and `drcVerified` remain false.
+
+### `easyeda_get_pcb_free_text_inventory` / `easyeda_prepare_pcb_free_text_delete`
+
+Read inventory and stage exact deletion of existing parentless PCB `String` objects, independently of tool-owned annotation receipts. Both require explicit `projectId`, `pcbUuid`, `expectedBoardName` and `protectedBoardName: "Board1"`; the active PCB must belong to the expected separate board. The reviewed parentless membership route is pinned to editor `3.2.209`.
+
+Inventory returns complete native text rows on layers **3/4/13**, mil units, compact preservation counts and `parentEvidence`. The public String instance has no parent getter: reviewed `String.getAll` filters parentless models, independent `String.get(id)` verifies exact type/style, and mandatory component Attribute inventory excludes attribute IDs. No invented parent field or ownership adoption is used.
+
+Prepare requires **`primitiveIds`** (1–100 unique exact IDs), **`expectedTexts`** (their complete inventory rows) and **`keepTextIds`** (an explicit disjoint array). It accepts deletion only; there is no create, modify, regex cleanup or ownership override. Apply through `easyeda_confirm_action` with the exact returned confirmation.
+
+Full native snapshots preserve all other String/Attribute rows, components, independent physical pads/nets, standalone pads, tracks/arcs/vias, polylines, regions/keepouts, pours/poured copper, fills and board inventory. Missing getters/categories or nonfinite native state fail closed. Deletes are sequential single-ID public String calls with awaited promises and per-ID journal. Unknown or partial outcomes never automatically replay or clean up. `saved:false` and `persistenceVerified:false` remain until separate real Epro/reopen proof; protected Board1 persisted contents also require independent export comparison. Default RPC timeout is60 seconds.
+
+
+#### Reviewed2→3 mechanical-extra pin contract
+
+`easyeda_prepare_schematic_legacy_recreate` optionally accepts `reviewedPinContract` **only at commit**, with `wireStrategy:"recreateNamedStubs"`. `mapping` contains exactly2 distinct `{oldPinNumber,newPinNumber}` entries covering every original pin; `extraNCpins` contains exactly1 `{pinNumber,reviewedRole:"mechanical",evidence}` entry covering the remaining staged pin. Exactly2 original and3 staged native pins are required. Numbers never imply mapping or NC automatically.
+
+The commit preview includes exact old→new named nets, new stub geometry and projected extra-pin NC/coordinates/evidence. Native staged extra pin must be NC; its final location cannot touch kept wires/pins/component anchors or proposed stubs. Final public geometry/native membership must equal the reviewed mapped nets plus the exact extra NC, while all kept contents remain strict. Missing/malformed contract, different pin sets, extra net or collision fail closed; unknown never replays. The default strict `preserve` strategy and stage behavior are unchanged. Evidence records a reviewed decision, not an assertion of physical metal isolation or PCB copper-pad verification.
+
+For connector replacements, review the selected part's public manufacturer drawing and explicitly distinguish electrical contacts from mechanical mounts. Manufacturer resources such as [JST's product documentation](https://www.jst-mfg.com/) are starting points; the evidence must identify the exact part and drawing used. Review the actual old supply/ground nets before selecting electrical mapping, and explicitly record any unconnected mechanical pin.
+
+
+#### Restore an applied legacy stage after bridge restart
+
+Pass the complete original applied `legacyDeviceStage` record as `originalRecord` to `easyeda_reconcile_schematic_legacy_stage`, with its original mutationId. This read-only path restores a missing registry entry only after exact receipt identity/confirmation/before-preview, settled SDK one-create/one-modify/no-delete evidence, native current-page snapshot, original/kept primitives, staged identity/NC and cached component/footprint references are independently verified. The restored result reports `reconciliation.previousStatus:"applied"` and `recoveredReceipt:true`; a new commit can then reference the same stageMutationId. It never recreates the staged part or replays CAD writes. Partial receipts, changed native contents, pending SDK calls and reference mismatches fail without registry insertion. Generic lifecycle restoration remains opt-in for this independently verified handler.
+
+#### Lossless large PCB preservation receipts
+
+NPTH and exact free-text mutations keep their complete native inventory proof in `record.before` using explicit `pcb_preservation_dictionary_v1` encoding. Dictionary references preserve every original native key/value and array order, including missing versus explicit undefined, null, and reviewed no-hole NaN tags; no geometry/net/ownership field is summarized or omitted. Consumers decode the inventory before selection/guards/readback and compare the complete lossless proof. Historical full JSON inventories remain accepted. The compact preview uses `beforeReference:"record.before"` and reports `proofEncoding` plus counts. The existing2,000,000-character serialization cap remains unchanged; dictionaries cannot make arbitrary oversized proofs eligible. A214-component regression verifies an expanded proof exceeding2MB, a receipt below2MB, exact roundtrip, successful one-hole preservation, and rejection of individual pad-net/unrelated-text drift before write.
+
+#### Explicit unroute: native topology changes between batches
+
+Before each original batch, the tool rereads native tracks/vias plus protected component/pad-net inventory. It dispatches only currently present IDs from that exact original batch; already absent IDs are journaled individually with `reason:"observed_absent_before_dispatch"`. Empty batches make no native delete call. New native IDs are recorded as `unexpectedNativeIds` and are never adopted into the approved selection. Changed original geometry, components/pad nets, protected unselected primitives or reappearing dispatched IDs stop later writes.
+
+This matters for the reviewed legacy Line adapter: the native track-delete handler aborts the entire batch if any supplied ID is missing, while the SDK discards its RPC payload and returns true after resolution. Native normalization may merge/split other selected tracks into new IDs after an earlier deletion. `nativeReturnedTrue` is therefore only journal metadata; independent ID-absence and complete final preservation readback remain mandatory. Newly generated geometry retains an unknown outcome unless independently proven absent without broadening this mutation. No dispatched batch is resent after unknown, and non-cancellable promises/deadlines keep their existing lifecycle behavior. Read-before-dispatch reduces known stale-ID batches; a race still results in unknown rather than a retry.
+
+### `easyeda_get_pcb_3d_transform` / `easyeda_prepare_pcb_3d_transform`
+
+These scoped tools inspect or stage exactly one existing component `OtherProperty["3D Model Transform"]`, pinned to reviewed editor3.2.209. Both require explicit `projectId`, `pcbUuid`, `expectedBoardName`, `protectedBoardName:"Board1"`, and `primitiveId`. The read-only probe returns the actual native component override, model/footprint references, component pose and physical pads; a transform copied from a library archive is not assumed to equal the placed component override. No model mesh/STEP or library source is loaded by this probe.
+
+Prepare additionally requires **`expectedOldTuple`** (the exact actual native string), **`expectedModelRef`**, **`expectedFootprintRef`** (complete public `{uuid,libraryUuid,name?}` values) and **`newTuple`** (exactly9 finite caller-reviewed numbers). Legacy tuple order is **`dx,dy,dz,rz,rx,ry,tx,ty,tz`**, linear values in **mil**, angles in **degrees**. The tool performs no mm, local/global, side or rotation conversion; v2 matrices, aliases and drawn transform attributes require separate review. It refuses incomplete core fields needed by public `done()`.
+
+The public getter [`getState_Model3D`](https://prodocs.easyeda.com/en/api/reference/pro-api.ipcb_primitivecomponent.getstate_model3d.html) returns the associated model reference; there is no reviewed direct Model3D setter. The documented [`setState_OtherProperty`](https://prodocs.easyeda.com/en/api/reference/pro-api.ipcb_primitivecomponent.setstate_otherproperty.html) can carry the transform string. This implementation uses only `toAsync()`, a one-key property patch and **`await instance.done()`**. It avoids legacy static `modify`/`setAttribute` helpers whose bundled implementations do not await the internal `done` promise. The complete lossless native inventory, component fields/BOM/model/footprint/pose, other attributes, pads/nets, copper and geometry are independently checked before and after. Exact confirmation is required; pending original promises retain the lifecycle lock, unknown never replays or rolls back. Native model alignment/export, persistence and saved archive proof remain false until verified separately.
+
+For authoring analysis only: bundled PCB exporter `pO` maps tuple9 offsets to `(tx/10−footprintOrigin.x,ty/10−footprintOrigin.y,tz/10)` in internal mil/10 units. The reviewed3D engine centers modelXY/minZ, scales, rotates `Rz→Rx→Ry`, then applies the model-local translation; a top-side component parent then applies its component Z rotation. Thus a top-side90° component needs `deltaTupleXYZ = Rz(−90°)·deltaGlobalMm /0.0254`, preserving the first6 entries for a pure translation. Bottom-side, v2 and alternate assembly frames cannot reuse this formula implicitly. Any numerical candidate is conditional on the actual native model/tuple/pose and matching source mesh; a20-pin and housing-height native export is still required.

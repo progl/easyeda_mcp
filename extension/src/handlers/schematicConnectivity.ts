@@ -1,11 +1,12 @@
 import { activeSchematic, focusPage, readPage } from "../mutation/schematicPages.js";
-import { collectNativeNetlist } from "./nativeNetlist.js";
+import { collectNativeNetlist, validateNativeNetlistTimeoutMs } from "./nativeNetlist.js";
 import { applyNativeNetlist } from "../../../src/schematic/nativeNetlist.js";
 import { toArray, isRecord, numeric, stringOrUndefined } from "../helpers.js";
 import type { SchematicPin } from "../../../src/schematic/types.js";
 import type { EasyEdaApi } from "../types.js";
 
 export async function collectSchematicMembership(api: () => EasyEdaApi, params: Record<string, any>) {
+  const nativeNetlistTimeoutMs = validateNativeNetlistTimeoutMs(params.nativeNetlistTimeoutMs);
   const ctx = await activeSchematic(api, params.target);
   const pins: Array<SchematicPin & { pageId: string }> = [];
   const counts = new Map<string, number>();
@@ -46,7 +47,7 @@ export async function collectSchematicMembership(api: () => EasyEdaApi, params: 
   } finally {
     await focusPage(api, ctx.target.documentId!, ctx.target.projectId!);
   }
-  const native = await collectNativeNetlist(api(), true);
+  const native = await collectNativeNetlist(api(), true, nativeNetlistTimeoutMs);
   native.ambiguousDesignators = [
     ...new Set([...(native.ambiguousDesignators ?? []), ...[...counts].filter(([, n]) => n > 1).map(([ref]) => ref)])
   ];

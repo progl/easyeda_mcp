@@ -308,3 +308,125 @@ describe("Extension Document Handlers", () => {
     });
   });
 });
+
+describe("safe document view refresh", () => {
+  function fixture() {
+    let active: any = { uuid: "doc", parentProjectUuid: "p", documentType: 1, tabId: "tab" };
+    let tabs: any[] = [{ tabId: "tab", documentUuid: "doc" }];
+    const sdk: any = {
+      dmt_SelectControl: { getCurrentDocumentInfo: vi.fn(async () => active) },
+      dmt_Project: { getCurrentProjectInfo: vi.fn(async () => ({ uuid: "p" })) },
+      sch_Document: { save: vi.fn(async () => true) },
+      dmt_EditorControl: {
+        getSplitScreenTree: vi.fn(async () => ({ id: "split", tabs })),
+        closeDocument: vi.fn(async () => {
+          setTimeout(() => {
+            tabs = [];
+            active = { parentProjectUuid: "p" };
+          }, 25);
+          return true;
+        }),
+        openDocument: vi.fn(async () => {
+          if (tabs.length) throw new Error("opened before close confirmed");
+          tabs = [{ tabId: "newtab", documentUuid: "doc" }];
+          active = { uuid: "doc", parentProjectUuid: "p", documentType: 1, tabId: "newtab" };
+          return "newtab";
+        })
+      }
+    };
+    const handler = createDocumentHandlers(() => sdk).refreshDocumentView;
+    return {
+      sdk,
+      handler,
+      target: { projectId: "p", documentId: "doc", documentType: "schematic" },
+      setActive: (x: any) => {
+        active = x;
+      }
+    };
+  }
+  it("requires save true and waits for actual asynchronous tab removal before opening once", async () => {
+    const f = fixture();
+    const result: any = await f.handler({ target: f.target, timeoutMs: 1000 });
+    expect(result).toMatchObject({
+      status: "refreshed",
+      saveVerified: true,
+      oldTabRemoved: true,
+      targetVerified: true,
+      visualRenderVerified: false
+    });
+    expect(f.sdk.sch_Document.save).toHaveBeenCalledTimes(1);
+    expect(f.sdk.dmt_EditorControl.closeDocument).toHaveBeenCalledExactlyOnceWith("tab");
+    expect(f.sdk.dmt_EditorControl.openDocument).toHaveBeenCalledTimes(1);
+  });
+  it("refreshes SDK tabs without a documentUuid using the independently verified active tab ID", async () => {
+    const f = fixture();
+    const getTree = f.sdk.dmt_EditorControl.getSplitScreenTree.getMockImplementation();
+    f.sdk.dmt_EditorControl.getSplitScreenTree.mockImplementation(async () => {
+      const tree = await getTree();
+      return { ...tree, tabs: tree.tabs.map((t: any) => ({ tabId: t.tabId, title: "PCB1", documentType: 1 })) };
+    });
+    const result: any = await f.handler({ target: f.target, timeoutMs: 1000 });
+    expect(result.status).toBe("refreshed");
+    expect(f.sdk.dmt_EditorControl.closeDocument).toHaveBeenCalledExactlyOnceWith("tab");
+    expect(f.sdk.dmt_EditorControl.openDocument).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, undefined])("never closes when save returned %s", async (value) => {
+    const f = fixture();
+    f.sdk.sch_Document.save.mockResolvedValue(value);
+    await expect(f.handler({ target: f.target, timeoutMs: 1000 })).rejects.toThrow(/save|saved/i);
+    expect(f.sdk.dmt_EditorControl.closeDocument).not.toHaveBeenCalled();
+    expect(f.sdk.dmt_EditorControl.openDocument).not.toHaveBeenCalled();
+  });
+  it("does not close if the active document changed while saving", async () => {
+    const f = fixture();
+    f.sdk.sch_Document.save.mockImplementation(async () => {
+      f.setActive({ uuid: "other", parentProjectUuid: "p", documentType: 1 });
+      return true;
+    });
+    await expect(f.handler({ target: f.target, timeoutMs: 1000 })).rejects.toThrow(/target|document/i);
+    expect(f.sdk.dmt_EditorControl.closeDocument).not.toHaveBeenCalled();
+  });
+  it("returns unknown after close if reopening fails, without repeating close/open", async () => {
+    const f = fixture();
+    f.sdk.dmt_EditorControl.openDocument.mockRejectedValue(new Error("open failed"));
+    const result: any = await f.handler({ target: f.target, timeoutMs: 1000 });
+    expect(result).toMatchObject({ status: "unknown", retryable: false, phase: "open" });
+    expect(f.sdk.dmt_EditorControl.closeDocument).toHaveBeenCalledTimes(1);
+    expect(f.sdk.dmt_EditorControl.openDocument).toHaveBeenCalledTimes(1);
+  });
+  it("does not continue to reopen after a timed-out close resolves late", async () => {
+    const f = fixture();
+    let resolve!: (value: boolean) => void;
+    f.sdk.dmt_EditorControl.closeDocument.mockImplementation(
+      () =>
+        new Promise<boolean>((r) => {
+          resolve = r;
+        })
+    );
+    const result: any = await f.handler({ target: f.target, timeoutMs: 200 });
+    expect(result).toMatchObject({ status: "unknown", phase: "close", retryable: false });
+    resolve(true);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(f.sdk.dmt_EditorControl.closeDocument).toHaveBeenCalledTimes(1);
+    expect(f.sdk.dmt_EditorControl.openDocument).not.toHaveBeenCalled();
+  });
+  it("never reopens until the actual old tab disappears", async () => {
+    const f = fixture();
+    f.sdk.dmt_EditorControl.closeDocument.mockResolvedValue(true);
+    const result: any = await f.handler({ target: f.target, timeoutMs: 200 });
+    expect(result).toMatchObject({ status: "unknown", phase: "wait_closed", oldTabRemoved: false });
+    expect(f.sdk.dmt_EditorControl.openDocument).not.toHaveBeenCalled();
+  });
+  it("aborts reopening if the active project changed after close", async () => {
+    const f = fixture();
+    const close = f.sdk.dmt_EditorControl.closeDocument.getMockImplementation();
+    f.sdk.dmt_EditorControl.closeDocument.mockImplementation(async () => {
+      const result = await close();
+      f.sdk.dmt_Project.getCurrentProjectInfo.mockResolvedValue({ uuid: "other" });
+      return result;
+    });
+    const result: any = await f.handler({ target: f.target, timeoutMs: 1000 });
+    expect(result).toMatchObject({ status: "unknown", retryable: false });
+    expect(f.sdk.dmt_EditorControl.openDocument).not.toHaveBeenCalled();
+  });
+});

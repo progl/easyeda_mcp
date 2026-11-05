@@ -109,29 +109,36 @@ describe("pcb3dInspection", () => {
       });
 
       const envelope = res.envelope as any;
-      expect(envelope.boardThicknessMm).toBe(1.6);
-      expect(envelope.maxHeightTopMm).toBe(3.2); // J1 is 3.2mm
-      expect(envelope.maxHeightBottomMm).toBe(0.6); // R1 is estimated 0.6mm
-      expect(envelope.totalEnvelopeHeightMm).toBe(5.4); // 1.6 + 3.2 + 0.6 = 5.4mm
-      expect(envelope.enclosureClearanceMm).toBe(4.6); // 10.0 - 5.4 = 4.6mm
-      expect(envelope.enclosureStatus).toBe("FIT");
+      expect(envelope.totalEnvelopeHeightMm).toBeNull();
+      expect(envelope.enclosureClearanceMm).toBeNull();
+      expect(envelope.enclosureStatus).toBe("UNKNOWN");
+      expect(res.nativeGeometryVerified).toBe(false);
+      expect(res.interferenceStatus).toBe("UNKNOWN");
+      expect(res.interferenceCollisions).toEqual([]);
+      expect(res.componentsWith3dModel).toBeNull();
+      const components = res.components as any[];
+      expect(components[2].heightMm).toBeNull();
+      expect(components[2].boundingBox3d).toBeNull();
+      expect(components[2].heuristic.heightEstimateMm).toBe(0.6);
+      expect(components[1].reportedModelHeightMm).toBe(3.2);
+    });
 
-      // Check missing 3D models: R1 should be missing
-      const missing = res.missing3dModels as any[];
-      expect(missing).toHaveLength(1);
-      expect(missing[0].designator).toBe("R1");
-
-      // Check height violations: J1 is 3.2mm > maxHeightMm 3.0mm
-      const violations = res.heightViolations as any[];
-      expect(violations).toHaveLength(1);
-      expect(violations[0].designator).toBe("J1");
-      expect(violations[0].exceededByMm).toBe(0.2);
-
-      // Check 3D interference collisions: U1 and J1 collide at (10, 10) on Top layer
-      const collisions = res.interferenceCollisions as any[];
-      expect(collisions.length).toBeGreaterThanOrEqual(1);
-      expect(collisions[0].componentA).toBe("U1");
-      expect(collisions[0].componentB).toBe("J1");
+    it("does not invent a loaded model or stringify footprint UUID objects as geometry", async () => {
+      const res = await inspectPcb3d(
+        () => ({
+          dmt_SelectControl: { getCurrentDocumentInfo: async () => mockPcbDoc },
+          pcb_PrimitiveComponent: {
+            getAll: async () => [{ designator: "TMC1", footprint: { uuid: "abc" }, model: {} }]
+          }
+        }),
+        { enclosureHeightMm: 30, checkInterference: true }
+      );
+      const c = (res.components as any[])[0];
+      expect(c.footprint).toBe("");
+      expect(c.has3DModel).toBeNull();
+      expect(c.heightMm).toBeNull();
+      expect((res.envelope as any).enclosureStatus).toBe("UNKNOWN");
+      expect(res.interferenceStatus).toBe("UNKNOWN");
     });
 
     it("rejects non-PCB document targets", async () => {

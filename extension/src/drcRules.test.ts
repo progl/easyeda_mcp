@@ -60,6 +60,95 @@ function fixture() {
 }
 
 describe("DRC editing", () => {
+  const convertedConfig = () => ({
+    Physics: {
+      Track: {
+        Power: {
+          unit: "mm",
+          form: {
+            status: 1,
+            data: {
+              "1": {
+                minValue: 0.1759966,
+                defaultValue: 0.254,
+                maxValue: 1.20000014
+              }
+            }
+          }
+        }
+      }
+    },
+    Spacing: {
+      "Safe Spacing": {
+        Default: {
+          unit: "mm",
+          tables: {
+            "1": { content: [[0.1759966, 0.254]], isOpen: 1 }
+          }
+        }
+      }
+    }
+  });
+  it("accepts only native dimensional unit-conversion roundoff in full configuration readback", async () => {
+    const f = fixture();
+    const config = convertedConfig();
+    f.drc.overwriteCurrentRuleConfiguration.mockImplementationOnce(async () => {
+      const actual = structuredClone(config);
+      actual.Physics.Track.Power.form.data["1"].maxValue = 1.2000001399999998;
+      actual.Spacing["Safe Spacing"].Default.tables["1"].content[0][0] = 0.17599659999999998;
+      f.setCurrent(actual);
+      return true;
+    });
+    expect((await f.apply(await f.prepare({ type: "updateCurrentConfiguration", config }))).status).toBe("applied");
+    expect(f.drc.overwriteCurrentRuleConfiguration).toHaveBeenCalledTimes(1);
+  });
+  it("retains exact stale-state checks even for a dimensional one-ULP change", async () => {
+    const f = fixture();
+    const config = convertedConfig();
+    f.setCurrent(config);
+    const edit = await f.prepare({ type: "updateCurrentConfiguration", config });
+    const drifted = structuredClone(config);
+    drifted.Physics.Track.Power.form.data["1"].maxValue = 1.2000001399999998;
+    f.setCurrent(drifted);
+    expect((await f.apply(edit)).status).toBe("failed");
+    expect(f.drc.overwriteCurrentRuleConfiguration).not.toHaveBeenCalled();
+  });
+  it("verifies a newly named profile with the same narrow dimensional conversion contract", async () => {
+    const f = fixture();
+    const config = convertedConfig();
+    const actual = structuredClone(config);
+    actual.Physics.Track.Power.form.data["1"].maxValue = 1.2000001399999998;
+    f.drc.getRuleConfiguration.mockResolvedValueOnce({ name: "Power", config: actual });
+    const edit = await f.prepare({ type: "createConfiguration", configurationName: "Power", config });
+    expect((await f.apply(edit)).status).toBe("applied");
+    expect(f.drc.saveRuleConfiguration).toHaveBeenCalledWith(config, "Power", false);
+  });
+  it.each(["spacing", "enum", "unit", "integer", "unknownField", "missingField", "extraField"])(
+    "keeps %s drift uncertain and non-replayable despite dimensional roundoff",
+    async (kind) => {
+      const f = fixture();
+      const config: any = convertedConfig();
+      config.unknownField = 0.1759966;
+      config.Physics.Track.Power.form.data["1"].minValue = 1;
+      f.drc.overwriteCurrentRuleConfiguration.mockImplementationOnce(async () => {
+        const actual = structuredClone(config);
+        actual.Physics.Track.Power.form.data["1"].maxValue = 1.2000001399999998;
+        if (kind === "spacing") actual.Spacing["Safe Spacing"].Default.tables["1"].content[0][0] += 0.0001;
+        if (kind === "enum") actual.Physics.Track.Power.form.status = 1 + Number.EPSILON;
+        if (kind === "unit") actual.Physics.Track.Power.unit = "mil";
+        if (kind === "integer") actual.Physics.Track.Power.form.data["1"].minValue = 1 + Number.EPSILON;
+        if (kind === "unknownField") actual.unknownField -= Number.EPSILON;
+        if (kind === "missingField") delete actual.Physics.Track.Power.form.status;
+        if (kind === "extraField") actual.extra = 0;
+        f.setCurrent(actual);
+        return true;
+      });
+      const edit = await f.prepare({ type: "updateCurrentConfiguration", config });
+      expect((await f.apply(edit)).status).toBe("unknown");
+      await expect(f.apply(edit)).rejects.toThrow("cannot be repeated");
+      expect(f.drc.overwriteCurrentRuleConfiguration).toHaveBeenCalledTimes(1);
+    }
+  );
   it("keeps a deeply nested valid rule preview and applied result queryable", async () => {
     const f = fixture();
     let config: Record<string, unknown> = { value: 1 };

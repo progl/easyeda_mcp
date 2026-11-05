@@ -48,7 +48,7 @@ export async function listSchematicPages(api: () => EasyEdaApi, params: Record<s
         item.componentAnchorBounds = anchorBounds(data.components.filter((c) => c.componentType === "part"));
         item.overRecommendedLimit = item.componentCount >= 150;
         const sheet = data.components.find((c) => c.componentType === "sheet");
-        item.format = sheet?.otherProperty?.["Page Size"];
+        item.format = frameFormat(sheet);
       }
       result.push(item);
     }
@@ -81,6 +81,16 @@ const formats: Record<string, [number, number]> = {
   A1: [3311, 2339],
   A0: [4681, 3311]
 };
+// The v3 runtime rounds sheet dimensions and can retain a stale custom Page Size attribute.
+function frameFormat(sheet: any): string | undefined {
+  const p = sheet?.otherProperty;
+  const width = Number(p?.Width),
+    height = Number(p?.Height);
+  if (Number.isFinite(width) && Number.isFinite(height)) {
+    return Object.entries(formats).find(([, [w, h]]) => Math.abs(width - w) <= 3 && Math.abs(height - h) <= 3)?.[0];
+  }
+  return p?.["Page Size"];
+}
 export async function prepareSchematicPage(api: () => EasyEdaApi, params: Record<string, any>) {
   const context = await activeSchematic(api, params.target);
   const action = String(params.action);
@@ -153,15 +163,16 @@ export async function executeSchematicPage(record: MutationRecord, api: () => Ea
       if (!pageId) throw new Error("Native page creation returned no UUID");
     }
     if (op.pageAction !== "format") {
-      if ((await api().dmt_Schematic.modifySchematicPageName(pageId, op.name)) === false)
-        throw new Error("Native rename failed");
-      const page = await api().dmt_Schematic.getSchematicPageInfo(pageId);
-      if (
-        !page ||
-        page.parentSchematicUuid !== op.schematicId ||
-        String(page.name).toLowerCase() !== op.name.toLowerCase()
-      )
-        throw new Error("Page readback failed");
+      await api().dmt_Schematic.modifySchematicPageName(pageId, op.name);
+      const deadline = Date.now() + 2000;
+      let page;
+      do {
+        page = await api().dmt_Schematic.getSchematicPageInfo(pageId);
+        if (page?.parentSchematicUuid === op.schematicId && String(page.name).toLowerCase() === op.name.toLowerCase())
+          break;
+        if (Date.now() >= deadline) throw new Error("Page readback failed");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } while (true);
       actualName = page.name;
     } else {
       await focusPage(api, pageId, context.target.projectId!);
@@ -175,10 +186,20 @@ export async function executeSchematicPage(record: MutationRecord, api: () => Ea
         Width: String(width),
         Height: String(height)
       };
-      await api().sch_PrimitiveComponent.modify(sheet.primitiveId, { otherProperty });
-      const actual = (await readPage(api)).components.find((c) => c.primitiveId === sheet.primitiveId);
-      if (canonicalJson(actual?.otherProperty) !== canonicalJson(otherProperty))
-        throw new Error("Drawing frame readback failed");
+      if (api().dmt_Schematic.modifySchematicPageTitleBlock) {
+        await api().dmt_Schematic.modifySchematicPageTitleBlock(undefined, {
+          Size: { showTitle: false, showValue: false, value: op.format }
+        });
+      } else {
+        await api().sch_PrimitiveComponent.modify(sheet.primitiveId, { otherProperty });
+      }
+      const deadline = Date.now() + 2000;
+      do {
+        const actual = (await readPage(api)).components.find((c) => c.primitiveId === sheet.primitiveId);
+        if (frameFormat(actual) === op.format) break;
+        if (Date.now() >= deadline) throw new Error("Drawing frame readback failed");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } while (true);
     }
     return {
       executed: true,

@@ -7,6 +7,21 @@ export type NativeNetlistData = {
   text?: string;
   reason?: string;
   ambiguousDesignators?: string[];
+  scope?: {
+    kind: "active_schematic";
+    verified: boolean;
+    schematicUuid?: string;
+    projectId?: string;
+    boardName?: string;
+    requestedPins: "current_page" | "all_current_schematic";
+    evidence: string;
+  };
+  read?: {
+    timeoutMs: number;
+    durationMs: number;
+    timedOut: boolean;
+    attemptedFormats: Array<"Protel2" | "EasyEDA">;
+  };
 };
 
 // Protel2 uses [component records] and (net name, reference-pin records).
@@ -89,13 +104,44 @@ export function parseNativeNetlist(text: string, format: "Protel2" | "EasyEDA"):
   return nets;
 }
 
+/** Only references in this native export belong to its ambiguity domain. */
+export function nativeExportDuplicateDesignators(text: string, format: "Protel2" | "EasyEDA"): string[] {
+  const references: string[] = [];
+  if (format === "EasyEDA") {
+    const data = JSON.parse(text.replace(/^\uFEFF/, ""));
+    for (const component of Object.values(data.components) as any[]) references.push(component.props.Designator);
+  } else {
+    let inComponent = false,
+      first = true;
+    for (const line of text
+      .replace(/^\uFEFF/, "")
+      .split(/\r?\n/)
+      .map((v) => v.trim())
+      .filter(Boolean)) {
+      if (line === "[") {
+        inComponent = true;
+        first = true;
+      } else if (line === "]") inComponent = false;
+      else if (inComponent && first) {
+        references.push(line);
+        first = false;
+      }
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const reference of references) counts.set(reference, (counts.get(reference) ?? 0) + 1);
+  return [...counts].filter(([, n]) => n > 1).map(([reference]) => reference);
+}
+
 export function applyNativeNetlist(pins: SchematicPin[], data?: NativeNetlistData) {
   const report = {
     status: data?.status ?? "unavailable",
     format: data?.format ?? "Protel2",
     matchedPins: 0,
     conflicts: 0,
-    reason: data?.reason
+    reason: data?.reason,
+    read: data?.read,
+    scope: data?.scope
   };
   const warnings: string[] = [];
   if (!data || data.status !== "available" || data.text === undefined) {
@@ -164,7 +210,8 @@ export function applyNativeNetlist(pins: SchematicPin[], data?: NativeNetlistDat
       }
     };
   });
-  if (ambiguous.size) warnings.push("Native mapping skipped for duplicate project designators.");
+  if (ambiguous.size)
+    warnings.push("Native mapping skipped for duplicate designators within the native export/current schematic scope.");
   if (!report.matchedPins)
     warnings.push(
       "Native netlist contains no unambiguous matches for the collected pins; geometry remains a fallback."

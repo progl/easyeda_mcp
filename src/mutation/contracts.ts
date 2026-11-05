@@ -33,6 +33,7 @@ export function canonicalJson(value: unknown, maxDepth = 40): string {
 
 export type MutationPreview<TBefore = unknown, TAfter = unknown> = {
   before: TBefore;
+  beforeReference?: "record.before";
   requestedAfter: TAfter;
   changedKeys?: string[];
   scope: string;
@@ -59,6 +60,14 @@ export type MutationRecord<TOperation = Record<string, unknown>, TData = unknown
   settledAt?: string;
   phase?: "execute" | "readback" | "settled";
   execution?: { timeoutMs: number; elapsedMs: number; lockHeld: boolean; recovery: string };
+  executionEvidence?: unknown;
+  reconciliation?: {
+    mode: "read_only";
+    reconciledAt: string;
+    previousStatus: "unknown" | "applied";
+    originalError?: string;
+    recoveredReceipt: boolean;
+  };
   documentSaved: false;
 };
 

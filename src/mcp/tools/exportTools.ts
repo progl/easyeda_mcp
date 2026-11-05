@@ -74,10 +74,15 @@ export function registerExportTools(server: McpServer, bridge: EditorClient): vo
   registerReadTool(server, bridge, {
     name: "easyeda_export_gerber",
     title: "Export EasyEDA Pro Gerber",
-    description: "Exports Gerber fabrication files from the active EasyEDA Pro PCB through the extension.",
+    description:
+      "Exports Gerber fabrication files. Set returnData:true to receive base64 ZIP bytes (maximum 20 MiB) without an OS save dialog. Data mode validates ZIP framing, not fabrication content. Default mode requests native saving; saved:null means no explicit save success was reported.",
     method: "exportGerber",
     inputSchema: {
       fileName: z.string().min(1).optional(),
+      returnData: z
+        .boolean()
+        .default(false)
+        .describe("Return bounded base64 ZIP data instead of asking EasyEDA to save a file."),
       timeoutMs: DefaultTimeoutSchema.default(60_000)
     },
     summary: "Requested EasyEDA Pro Gerber export."
@@ -161,11 +166,11 @@ export function registerExportTools(server: McpServer, bridge: EditorClient): vo
     name: "easyeda_export_project_archive",
     title: "Export complete EasyEDA Pro project archive",
     description:
-      "Exports the entire EasyEDA Pro project archive (epro, zip, json) containing all schematic sheets, PCB layout, layer configurations, netlists, and project metadata with integrity validation.",
+      "Exports a real native project File via public sys_FileManager getProjectFile APIs (epro/epro2), without synthetic JSON/ZIP fallback. Native File/save evidence does not prove archive completeness or restoration; inspect downloads and test a copy before destructive edits. Native inclusion settings cannot be individually selected or verified by this API.",
     method: "exportProjectArchive",
     inputSchema: {
       fileName: z.string().min(1).optional().describe("Optional output file name without extension."),
-      format: z.enum(["epro", "zip", "json"]).default("epro").describe("Archive bundle format (epro, zip, json)."),
+      format: z.enum(["epro", "epro2"]).default("epro").describe("Native project archive format: epro or epro2."),
       includeLibraries: z.boolean().default(true).describe("Bundle custom library symbols and footprints."),
       includeHistory: z.boolean().default(false).describe("Include revision and change history."),
       destinationPath: z.string().min(1).optional().describe("Optional destination directory / target path."),

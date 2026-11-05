@@ -1,3 +1,11 @@
+import { executePcbPlacements } from "./pcbPlacementReadback.js";
+import {
+  assertTrackCoverage,
+  executePcbTrackViaMutation,
+  fetchPcbTracks,
+  fetchPcbVias
+} from "./pcbTrackViaMutations.js";
+import { pcbToNative, pcbUnits, type PcbUnits } from "../pcbUnits.js";
 import { apiError, isRecord, numeric, optionalCall, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
@@ -42,6 +50,7 @@ export interface ParsedLineEntity {
 
 export interface ParsedExternalData {
   format: ExternalImportFormat;
+  units?: PcbUnits;
   tracks: ParsedTrackSegment[];
   vias: ParsedVia[];
   placements: ParsedPlacement[];
@@ -362,6 +371,7 @@ export function parseEasyEdaRouterJson(
 
   return {
     format: "easyeda_router_json",
+    units: pcbUnits(json.units ?? "mm"),
     tracks,
     vias,
     placements: [],
@@ -733,6 +743,7 @@ export async function preparePcbExternalImportMutation(
     target: currentTarget,
     operation: {
       action: "import_external",
+      target: currentTarget,
       format: params.format,
       parsedData: parsed,
       targetLayer: params.targetLayer
@@ -774,77 +785,158 @@ export async function executePcbExternalImportMutation(
   }
 
   const format = parsedData.format;
-  const createdTrackIds: string[] = [];
+  const trackReadbacks: Record<string, unknown>[] = [];
   const createdViaIds: string[] = [];
   const createdLineIds: string[] = [];
   const modifiedComponents: string[] = [];
+  const placementDeadline = Date.now() + 40000;
+  let placementReadback: Record<string, unknown> | undefined;
 
   // 1. Execute layout placements
   if (parsedData.placements.length > 0) {
     if (!eda.pcb_PrimitiveComponent?.getAll || !eda.pcb_PrimitiveComponent?.modify) {
       throw apiError("api_unavailable", "PCB component placement API (pcb_PrimitiveComponent.modify) is unavailable.");
     }
-    const allComponents = toArray(await optionalCall(() => eda.pcb_PrimitiveComponent.getAll()));
+    const placementRead = async <T>(call: () => Promise<T> | T): Promise<T> => {
+      const remaining = placementDeadline - Date.now();
+      if (remaining <= 0)
+        throw apiError("execution_budget_expired", "PCB layout lookup deadline expired; no placement writes started.");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          Promise.resolve().then(call),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () =>
+                reject(
+                  apiError(
+                    "execution_budget_expired",
+                    "PCB layout lookup timed out; no later placement writes will start."
+                  )
+                ),
+              remaining
+            );
+          })
+        ]);
+        if (Date.now() >= placementDeadline)
+          throw apiError("execution_budget_expired", "PCB layout lookup arrived after deadline.");
+        return result;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const placementTarget = extractDocumentIdentity(
+      await placementRead(() => eda.dmt_SelectControl?.getCurrentDocumentInfo?.())
+    );
+    if (op.target) assertDocumentTargetMatch(op.target, placementTarget);
+    if (placementTarget.documentType !== "pcb" || !placementTarget.documentId || !placementTarget.projectId)
+      throw apiError("invalid_target", "PCB layout requires an identifiable active PCB/project before lookup.");
+    const allComponents = await placementRead(() => eda.pcb_PrimitiveComponent.getAll());
+    if (!Array.isArray(allComponents))
+      throw apiError("unverified_inventory", "PCB placement lookup did not return component array.");
     const compMap = new Map<string, any>();
     for (const comp of allComponents) {
       const c = comp as Record<string, any>;
       const des = c.getState_Designator?.() ?? c.designator ?? c.prefix;
-      if (des) compMap.set(String(des).toUpperCase(), c);
-    }
-
-    for (const plc of parsedData.placements) {
-      const targetComp = compMap.get(plc.designator.toUpperCase());
-      if (targetComp) {
-        const primId = targetComp.getState_PrimitiveId?.() ?? targetComp.primitiveId ?? targetComp.id;
-        await eda.pcb_PrimitiveComponent.modify({
-          primitiveId: primId,
-          x: plc.x,
-          y: plc.y,
-          rotation: plc.rotation ?? targetComp.getState_Rotation?.() ?? 0,
-          layer: plc.layer ?? targetComp.getState_Layer?.() ?? 1
-        });
-        modifiedComponents.push(plc.designator);
+      if (des) {
+        const key = String(des).toUpperCase();
+        if (compMap.has(key))
+          throw apiError("ambiguous_component", `PCB designator ${key} is duplicated; no placement writes started.`);
+        compMap.set(key, c);
       }
     }
+
+    const placements = parsedData.placements.map((plc) => {
+      const targetComp = compMap.get(plc.designator.toUpperCase());
+      if (!targetComp)
+        throw apiError(
+          "component_not_found",
+          `PCB layout target ${plc.designator} was not found; no placement writes started.`
+        );
+      const primitiveId = String(targetComp.getState_PrimitiveId?.() ?? targetComp.primitiveId ?? targetComp.id ?? "");
+      return {
+        primitiveId,
+        designator: plc.designator,
+        x: plc.x,
+        y: plc.y,
+        rotation: plc.rotation ?? targetComp.getState_Rotation?.() ?? targetComp.rotation ?? 0,
+        layer: plc.layer ?? targetComp.getState_Layer?.() ?? targetComp.layer ?? 1
+      };
+    });
+    placementReadback = await executePcbPlacements(api, placements, {
+      target: placementTarget,
+      deadline: placementDeadline
+    });
+    modifiedComponents.push(...parsedData.placements.map((plc) => plc.designator));
   }
 
-  // 2. Execute tracks creation
-  if (parsedData.tracks.length > 0) {
-    if (!eda.pcb_PrimitiveTrack?.create) {
-      throw apiError("api_unavailable", "PCB track creation API (pcb_PrimitiveTrack.create) is unavailable.");
-    }
-    for (const trk of parsedData.tracks) {
-      const res = await eda.pcb_PrimitiveTrack.create({
-        net: trk.net,
-        layer: trk.layer,
-        startX: trk.startX,
-        startY: trk.startY,
-        endX: trk.endX,
-        endY: trk.endY,
-        lineWidth: trk.width
-      });
-      const id = typeof res === "string" ? res : (res?.primitiveId ?? res?.id);
-      if (id) createdTrackIds.push(String(id));
+  // External router/SES geometry is metric unless router JSON explicitly says mil.
+  // Placement imports intentionally retain their existing native coordinate contract.
+  const inputUnits = pcbUnits(parsedData.units ?? "mm");
+  const nativeTracks = parsedData.tracks.map((t) => ({
+    entity: "track" as const,
+    action: "create" as const,
+    net: t.net,
+    layer: t.layer,
+    startX: pcbToNative(t.startX, inputUnits),
+    startY: pcbToNative(t.startY, inputUnits),
+    endX: pcbToNative(t.endX, inputUnits),
+    endY: pcbToNative(t.endY, inputUnits),
+    lineWidth: pcbToNative(t.width, inputUnits)
+  }));
+  const nativeVias = parsedData.vias.map((v) => ({
+    entity: "via" as const,
+    action: "create" as const,
+    net: v.net,
+    x: pcbToNative(v.x, inputUnits),
+    y: pcbToNative(v.y, inputUnits),
+    diameter: pcbToNative(v.diameter, inputUnits),
+    holeDiameter: pcbToNative(v.hole, inputUnits)
+  }));
+  const routeGuard = async () => {
+    if (op.target)
+      assertDocumentTargetMatch(
+        op.target,
+        extractDocumentIdentity(await eda.dmt_SelectControl?.getCurrentDocumentInfo?.())
+      );
+    if (Date.now() >= placementDeadline)
+      throw apiError("execution_budget_expired", "Routing import deadline expired; no later writes will start.");
+  };
+  for (const track of nativeTracks) {
+    await routeGuard();
+    const result = await executePcbTrackViaMutation(api, {
+      ...track,
+      target: op.target,
+      mutationId: op.mutationId
+    } as any);
+    trackReadbacks.push(result.readback);
+  }
+  for (const via of nativeVias) {
+    await routeGuard();
+    const result = await executePcbTrackViaMutation(api, via);
+    createdViaIds.push(String(result.readback.primitiveId));
+  }
+  // Recheck the complete batch after the last write, including native splits.
+  if (nativeTracks.length) {
+    const all = await fetchPcbTracks(eda, { limit: 5000 });
+    for (const track of nativeTracks) assertTrackCoverage(all.tracks, track);
+  }
+  if (nativeVias.length) {
+    const all = await fetchPcbVias(eda, { limit: 5000 });
+    for (let i = 0; i < nativeVias.length; i++) {
+      const actual = all.vias.find((v) => v.primitiveId === createdViaIds[i]),
+        expected = nativeVias[i];
+      if (
+        !actual ||
+        actual.net !== expected.net ||
+        !["x", "y", "diameter", "holeDiameter"].every(
+          (k) => Math.abs((actual as any)[k] - (expected as any)[k]) <= 1e-4
+        )
+      )
+        throw apiError("write_readback_unknown", "Imported via final readback mismatch; do not repeat import.");
     }
   }
-
-  // 3. Execute vias creation
-  if (parsedData.vias.length > 0) {
-    if (!eda.pcb_PrimitiveVia?.create) {
-      throw apiError("api_unavailable", "PCB via creation API (pcb_PrimitiveVia.create) is unavailable.");
-    }
-    for (const v of parsedData.vias) {
-      const res = await eda.pcb_PrimitiveVia.create({
-        net: v.net,
-        x: v.x,
-        y: v.y,
-        diameter: v.diameter,
-        holeDiameter: v.hole
-      });
-      const id = typeof res === "string" ? res : (res?.primitiveId ?? res?.id);
-      if (id) createdViaIds.push(String(id));
-    }
-  }
+  await routeGuard();
 
   // 4. Execute CAD / DXF lines creation
   if (parsedData.lines.length > 0) {
@@ -868,8 +960,8 @@ export async function executePcbExternalImportMutation(
 
   // 5. Readback verification: strictly query editor state to verify primitives were created
   let finalTracksCount = 0;
-  if (eda.pcb_PrimitiveTrack?.getAll) {
-    finalTracksCount = toArray(await optionalCall(() => eda.pcb_PrimitiveTrack.getAll())).length;
+  if (eda.pcb_PrimitiveTrack?.getAll || eda.pcb_PrimitiveLine?.getAll) {
+    finalTracksCount = (await fetchPcbTracks(eda, { limit: 5000 })).total;
   }
   let finalViasCount = 0;
   if (eda.pcb_PrimitiveVia?.getAll) {
@@ -885,7 +977,7 @@ export async function executePcbExternalImportMutation(
 
   // Verify that newly created items are accounted for
   if (
-    (expectedTracks > 0 && finalTracksCount < beforeTracks + expectedTracks && createdTrackIds.length === 0) ||
+    (expectedTracks > 0 && finalTracksCount < beforeTracks + expectedTracks && trackReadbacks.length === 0) ||
     (expectedVias > 0 && finalViasCount < beforeVias + expectedVias && createdViaIds.length === 0)
   ) {
     throw apiError(
@@ -898,10 +990,13 @@ export async function executePcbExternalImportMutation(
     executed: true,
     readback: {
       format,
-      createdTracksCount: createdTrackIds.length > 0 ? createdTrackIds.length : expectedTracks,
+      createdTracksCount: nativeTracks.length,
+      verifiedTrackRequestsCount: trackReadbacks.length,
+      trackReadbacks,
       createdViasCount: createdViaIds.length > 0 ? createdViaIds.length : expectedVias,
       createdLinesCount: createdLineIds.length > 0 ? createdLineIds.length : parsedData.lines.length,
       modifiedComponentsCount: modifiedComponents.length,
+      ...(placementReadback ? { placementReadback } : {}),
       totalImportedPrimitives: parsedData.totalPrimitives,
       finalTracksTotal: finalTracksCount,
       finalViasTotal: finalViasCount,

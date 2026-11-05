@@ -1,3 +1,16 @@
+import { registerPcb3dTransformTools } from "./tools/pcb3dTransformTools.js";
+import { registerPcbFreeTextTools } from "./tools/pcbFreeTextTools.js";
+import { registerMechanicalPadTools } from "./tools/mechanicalPadTools.js";
+import { registerLibraryFileExportTools } from "./tools/libraryFileExportTools.js";
+import { registerSchematicLegacyRecreateTools } from "./tools/schematicLegacyRecreateTools.js";
+import { registerSchematicCreateReconcileTools } from "./tools/schematicCreateReconcileTools.js";
+import { registerSchematicPruneTools } from "./tools/schematicPruneTools.js";
+import { registerBoardOperationTools } from "./tools/boardOperationTools.js";
+import { registerSchematicPageCopyTools } from "./tools/schematicPageCopyTools.js";
+import { registerSchematicDeviceReplaceTools } from "./tools/schematicDeviceReplaceTools.js";
+import { registerSchematicAttributeTools } from "./tools/schematicAttributeTools.js";
+import { registerNativePreflightTools } from "./tools/nativePreflightTools.js";
+import { registerPcbAnnotationTools } from "./tools/pcbAnnotationTools.js";
 import { registerSchematicPageTools } from "./tools/schematicPageTools.js";
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { EditorClient } from "../editor/EditorClient.js";
@@ -16,13 +29,26 @@ export { DefaultTimeoutSchema, hasExplicitMutationConfirmation, registerReadTool
 
 export function registerEasyEdaTools(server: McpServer, bridge: EditorClient): void {
   registerStatusTools(server, bridge);
+  registerBoardOperationTools(server, bridge);
+  registerSchematicAttributeTools(server, bridge);
+  registerNativePreflightTools(server, bridge);
   registerSchematicTools(server, bridge);
   registerPcbTools(server, bridge);
+  registerMechanicalPadTools(server, bridge);
+  registerPcbFreeTextTools(server, bridge);
+  registerPcb3dTransformTools(server, bridge);
+  registerPcbAnnotationTools(server, bridge);
   registerDrcTools(server, bridge);
   registerExportTools(server, bridge);
+  registerLibraryFileExportTools(server, bridge);
   registerDocumentTools(server, bridge);
   registerSchematicPageTools(server, bridge);
+  registerSchematicPageCopyTools(server, bridge);
   registerSchematicMutationTools(server, bridge);
+  registerSchematicPruneTools(server, bridge);
+  registerSchematicDeviceReplaceTools(server, bridge);
+  registerSchematicLegacyRecreateTools(server, bridge);
+  registerSchematicCreateReconcileTools(server, bridge);
   registerActionTools(server, bridge);
   registerSpiceTools(server, bridge);
 }

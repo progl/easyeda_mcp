@@ -18,12 +18,22 @@ export type BridgeCapabilities = {
   schManufactureData: boolean;
   fileSystem: boolean;
   drcRules?: Record<string, boolean>;
+  applicationHeartbeat?: boolean;
+};
+
+export type BrowserIdentity = {
+  browserName: "Firefox" | "Chrome" | "Edge" | "Safari" | "Opera" | "Electron" | "Unknown";
+  version?: string;
+  appKind: "browser" | "desktop" | "unknown";
+  source: "user_agent";
 };
 
 export type EditorStatus = {
   connected: boolean;
   connectionState?: "disconnected" | "connecting" | "connected" | "blocked";
   extensionVersion?: string;
+  runtimeId?: string;
+  browserIdentity?: BrowserIdentity;
   protocolVersion?: string;
   compatibility?: ProtocolCompatibility;
   capabilities?: Partial<BridgeCapabilities>;
@@ -40,6 +50,9 @@ export type BridgeHelloMessage = {
   kind: "hello";
   client: "easyeda-pro-extension";
   version: string;
+  runtimeId?: string;
+  browserIdentity?: BrowserIdentity;
+  takeover?: boolean;
   protocolVersion: string;
   compatibility?: ProtocolCompatibility;
   capabilities: Partial<BridgeCapabilities>;
@@ -82,10 +95,20 @@ export type BridgeErrorMessage = {
   };
 };
 
-export type ClientToServerMessage =
-  BridgeHelloMessage | BridgeStatusMessage | BridgeEventMessage | BridgeResultMessage | BridgeErrorMessage;
+export type BridgePingMessage = { kind: "ping"; pingId: string };
+export type BridgePongMessage = { kind: "pong"; pingId: string };
+export type BridgeHeartbeatOffer = { kind: "heartbeat_offer"; version: 1 };
+export type BridgeRuntimeRetired = { kind: "runtime_retired"; reason: string };
 
-export type ServerToClientMessage = BridgeCallMessage;
+export type ClientToServerMessage =
+  | BridgeHelloMessage
+  | BridgeStatusMessage
+  | BridgeEventMessage
+  | BridgeResultMessage
+  | BridgeErrorMessage
+  | BridgePingMessage;
+
+export type ServerToClientMessage = BridgeCallMessage | BridgePongMessage | BridgeHeartbeatOffer | BridgeRuntimeRetired;
 
 export type RpcErrorPayload = BridgeErrorMessage["error"];
 
@@ -100,6 +123,10 @@ export function parseClientMessage(raw: string): ClientToServerMessage {
   }
 
   switch (parsed.kind) {
+    case "ping":
+      if (typeof parsed.pingId !== "string" || !parsed.pingId.length || parsed.pingId.length > 128)
+        throw new Error("Heartbeat pingId must contain 1–128 characters.");
+      return parsed as BridgePingMessage;
     case "hello":
     case "status":
     case "event":

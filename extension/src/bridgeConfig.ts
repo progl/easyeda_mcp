@@ -3,6 +3,7 @@ export type ExtensionBridgeConfig = {
   port: number;
   openTimeoutMs: number;
   heartbeatIntervalMs: number;
+  heartbeatAckTimeoutMs?: number;
   reconnectDelayMs: number[];
 };
 
@@ -13,6 +14,7 @@ const defaultBridgeConfig: ExtensionBridgeConfig = {
   port: 8765,
   openTimeoutMs: 2_500,
   heartbeatIntervalMs: 15_000,
+  heartbeatAckTimeoutMs: 5_000,
   reconnectDelayMs: [0, 1_000, 2_500, 5_000]
 };
 

@@ -3,6 +3,8 @@ import { canonicalJson, type MutationRecord } from "../../../src/mutation/contra
 import { extensionMutations } from "./mutationManager.js";
 import type { EasyEdaApi } from "../types.js";
 import type { DocumentIdentity } from "../identity.js";
+import { collectNativeNetlist } from "../handlers/nativeNetlist.js";
+import { parseNativeNetlist } from "../../../src/schematic/nativeNetlist.js";
 
 type Segment = { x1: number; y1: number; x2: number; y2: number };
 type Pin = { pin: string; x: number; y: number; rotation: number };
@@ -83,7 +85,10 @@ async function plan(api: () => EasyEdaApi, component: string, requested: unknown
   }
   const pins: Array<Pin & { net: string }> = [];
   const wires: PlannedWire[] = [];
-  for (const [number, rawNet] of Object.entries(requested)) {
+  // MutationLifecycle canonicalizes object keys but preserves array order. Build
+  // plan arrays in the same deterministic order before and after that roundtrip.
+  const requestedPins = Object.entries(requested).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  for (const [number, rawNet] of requestedPins) {
     if (typeof rawNet !== "string" || !rawNet.trim() || rawNet.length > 128 || /[\r\n]/.test(rawNet))
       throw apiError("invalid_params", `Invalid net for pin ${number}.`);
     const p = allPins.find((p) => p.pin === number);
@@ -176,11 +181,56 @@ export async function executePinNets(record: MutationRecord, api: () => EasyEdaA
       );
     }
   }
-  const readback = await plan(api, op.component, op.pinNets, op.wireStubLength);
-  if (readback.wires.length)
-    throw apiError("write_readback_unknown", "Batch wire readback did not confirm all connections. Do not replay.");
+  let verificationSource = "wire_geometry";
+  let nativeVerified = false;
+  // Exporting the native netlist also flushes deferred net-name publication in v3.
+  // The exporter has its own bounded timeout; writes are never retried here.
+  if (created.length && api().sch_ManufactureData?.getNetlistFile) {
+    const native = await collectNativeNetlist(api(), false);
+    if (
+      native.status === "available" &&
+      native.text !== undefined &&
+      !native.ambiguousDesignators?.includes(current.designator)
+    ) {
+      const nets = parseNativeNetlist(native.text, native.format);
+      const nativeMatches = current.pins.map((pin) => {
+        const member = `${current.designator}-${pin.pin}`;
+        const names = [...nets].filter(([, members]) => members.includes(member)).map(([name]) => name);
+        if (names.some((name) => name !== pin.net))
+          throw apiError(
+            "write_readback_unknown",
+            `Native netlist conflicts with requested net for ${member}. Do not replay.`
+          );
+        return names.length === 1;
+      });
+      nativeVerified = nativeMatches.every(Boolean);
+    }
+  }
+  if (nativeVerified) {
+    verificationSource = "native_netlist";
+  } else {
+    const deadline = Date.now() + 1500;
+    while (true) {
+      try {
+        const readback = await plan(api, op.component, op.pinNets, op.wireStubLength);
+        if (!readback.wires.length) break;
+      } catch (error) {
+        // A deferred unnamed wire may briefly look like a conflicting connection.
+        if ((error as { code?: string }).code !== "connection_conflict") throw error;
+      }
+      if (Date.now() >= deadline)
+        throw apiError("write_readback_unknown", "Batch wire readback did not confirm all connections. Do not replay.");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
   return {
     executed: true,
-    readback: { component: current.designator, connectedPins: current.pins, createdWireIds: created, verified: true }
+    readback: {
+      component: current.designator,
+      connectedPins: current.pins,
+      createdWireIds: created,
+      verificationSource,
+      verified: true
+    }
   };
 }

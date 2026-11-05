@@ -52,6 +52,65 @@ describe("component pin-net batch", () => {
     );
   });
 
+  it("keeps mixed numeric and composite USB pin plans stable across mutation serialization", async () => {
+    const f = fixture();
+    const numbers = [
+      "A1B12",
+      "A4B9",
+      "B8",
+      "A5",
+      "B7",
+      "A6",
+      "A7",
+      "B6",
+      "A8",
+      "B5",
+      "B4A9",
+      "B1A12",
+      "4",
+      "3",
+      "2",
+      "1"
+    ];
+    f.pins.splice(
+      0,
+      f.pins.length,
+      ...numbers.map((pinNumber, index) => ({ pinNumber, x: 100, y: index * 20, rotation: 180 }))
+    );
+    f.eda.sch_PrimitiveComponent.getAll.mockResolvedValue([
+      { primitiveId: "usb", designator: "J_USB", x: 120, y: 100 }
+    ]);
+    const p = await prepareSchematicComponentMutation(f.api, {
+      action: "update",
+      component: "J_USB",
+      properties: {
+        wireStubLength: 2,
+        pinNets: {
+          A1B12: "GND",
+          B1A12: "GND",
+          "1": "GND",
+          "2": "GND",
+          "3": "GND",
+          "4": "GND",
+          A4B9: "USB_VBUS",
+          B4A9: "USB_VBUS",
+          A5: "USB_CC1",
+          B5: "USB_CC2"
+        }
+      }
+    });
+    const handlers = createActionHandlers(f.api, {} as any, extensionMutations);
+    const result = (await handlers.confirmedAction({
+      action: "mutation",
+      params: { mutationId: p.mutationId },
+      confirmation: p.confirmation
+    })) as any;
+    expect(result.status).toBe("applied");
+    expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(10);
+    expect(f.wires.filter((wire) => wire.net === "GND")).toHaveLength(6);
+    expect(f.wires.filter((wire) => wire.net === "USB_VBUS")).toHaveLength(2);
+  });
+
   it("stops a partial write without replaying earlier pins", async () => {
     const f = fixture();
     const p = await prepareSchematicComponentMutation(f.api, params);
@@ -66,6 +125,57 @@ describe("component pin-net batch", () => {
       executeSchematicComponentMutation(extensionMutations.get(String(p.mutationId)), f.api)
     ).rejects.toThrow(/Do not replay/);
     expect(f.wires).toHaveLength(1);
+    expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for deferred wire publication without creating duplicate wires", async () => {
+    const f = fixture();
+    const p = await prepareSchematicComponentMutation(f.api, params);
+    let pendingReads = 2;
+    f.eda.sch_PrimitiveWire.getAll.mockImplementation(async () =>
+      f.wires.length && pendingReads-- > 0 ? [] : f.wires
+    );
+    const result = await executeSchematicComponentMutation(extensionMutations.get(String(p.mutationId)), f.api);
+    expect(result.readback.verified).toBe(true);
+    expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts exact native pin membership while wire publication is still stale", async () => {
+    const f = fixture();
+    const p = await prepareSchematicComponentMutation(f.api, params);
+    f.eda.sch_PrimitiveWire.getAll.mockResolvedValue([]);
+    const exportNetlist = vi.fn(async () => ({ text: async () => "(\nVCC\nR1-1\n)\n(\nGND\nR1-2\n)" }));
+    const api = () => ({ ...f.eda, sch_ManufactureData: { getNetlistFile: exportNetlist } });
+    const result = await executeSchematicComponentMutation(extensionMutations.get(String(p.mutationId)), api);
+    expect(result.readback.verified).toBe(true);
+    expect(result.readback.verificationSource).toBe("native_netlist");
+    expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(2);
+    expect(exportNetlist).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops after the bounded readback window without replaying missing wires", async () => {
+    const f = fixture();
+    const p = await prepareSchematicComponentMutation(f.api, params);
+    f.eda.sch_PrimitiveWire.getAll.mockResolvedValue([]);
+    await expect(
+      executeSchematicComponentMutation(extensionMutations.get(String(p.mutationId)), f.api)
+    ).rejects.toThrow(/Do not replay/);
+    expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(2);
+    expect(f.eda.sch_PrimitiveWire.getAll.mock.calls.length).toBeLessThan(40);
+  });
+
+  it("does not confirm geometric wires when native pin membership conflicts", async () => {
+    const f = fixture();
+    const p = await prepareSchematicComponentMutation(f.api, params);
+    const api = () => ({
+      ...f.eda,
+      sch_ManufactureData: {
+        getNetlistFile: vi.fn(async () => ({ text: async () => "(\nOTHER\nR1-1\n)\n(\nGND\nR1-2\n)" }))
+      }
+    });
+    await expect(executeSchematicComponentMutation(extensionMutations.get(String(p.mutationId)), api)).rejects.toThrow(
+      /native.*conflict/i
+    );
     expect(f.eda.sch_PrimitiveWire.create).toHaveBeenCalledTimes(2);
   });
 

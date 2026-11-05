@@ -1,10 +1,14 @@
+import { collectNativeNetlist } from "../handlers/nativeNetlist.js";
+import { readSchematicAttributes, restoreSchematicAttributes } from "./schematicAttributes.js";
 import { apiError, toArray, isRecord } from "../helpers.js";
 import { canonicalJson, type MutationRecord } from "../../../src/mutation/contracts.js";
 import { extensionMutations } from "./mutationManager.js";
-import { activeSchematic, focusPage, plain, readPage } from "./schematicPages.js";
+import { activeSchematic, focusPage, readPage } from "./schematicPages.js";
 import type { EasyEdaApi } from "../types.js";
 
 type Segment = { x1: number; y1: number; x2: number; y2: number };
+// Shared conservative electrical-boundary geometry for in-place layout as well as transfer.
+export { segments as blockWireSegments, touch as blockTouches, intersect as blockIntersects };
 function segments(line: any): Segment[] {
   const paths = Array.isArray(line) && Array.isArray(line[0]) ? line : [line];
   return paths.flatMap((path: any) => {
@@ -60,31 +64,6 @@ function identity(c: any) {
     addIntoBom: c.addIntoBom ?? true,
     addIntoPcb: c.addIntoPcb ?? true
   };
-}
-function attributeProps(a: any, dx = 0, dy = 0) {
-  const keys = [
-    "x",
-    "y",
-    "rotation",
-    "color",
-    "fontName",
-    "fontSize",
-    "bold",
-    "italic",
-    "underLine",
-    "alignMode",
-    "fillColor",
-    "key",
-    "value",
-    "keyVisible",
-    "valueVisible"
-  ];
-  const p: any = Object.fromEntries(keys.filter((k) => a[k] !== undefined).map((k) => [k, a[k]]));
-  if (typeof p.x === "number" && typeof p.y === "number") {
-    p.x += dx;
-    p.y += dy;
-  }
-  return p;
 }
 async function resolveDevice(api: () => EasyEdaApi, c: any) {
   if (!/^[a-f0-9]{16}$/i.test(c.component.uuid)) return c.component;
@@ -154,10 +133,7 @@ async function plan(api: () => EasyEdaApi, params: any) {
   const attributes: Record<string, any[]> = {};
   if (!api().sch_PrimitiveAttribute?.getAll)
     throw apiError("capability_unavailable", "Attribute inspection is required to preserve annotations.");
-  for (const c of comps)
-    attributes[c.primitiveId] = toArray(await api().sch_PrimitiveAttribute.getAll(c.primitiveId))
-      .filter(isRecord)
-      .map(plain);
+  for (const c of comps) attributes[c.primitiveId] = await readSchematicAttributes(api, c.primitiveId);
 
   const pins: any[] = [];
   for (const c of source.components) {
@@ -309,6 +285,34 @@ export async function prepareBlockTransfer(api: () => EasyEdaApi, params: Record
     expiresAt: record.expiresAt
   };
 }
+function copyReadbackProblem(current: any, actual: any, journal: any): string | undefined {
+  for (const c of current.components) {
+    const entry = journal.createdComponents.find((e: any) => e.sourceId === c.primitiveId);
+    const copy = actual.components.find((d: any) => d.primitiveId === entry.destinationId);
+    if (
+      !copy ||
+      canonicalJson(identity(copy)) !==
+        canonicalJson({ ...identity(c), ...entry.temporary, x: c.x + current.dx, y: c.y + current.dy })
+    )
+      return `Identity/footprint/property readback failed: ${c.designator}`;
+  }
+  for (const w of current.wires) {
+    const expected = segments(w.line).map((s) => ({
+      x1: s.x1 + current.dx,
+      y1: s.y1 + current.dy,
+      x2: s.x2 + current.dx,
+      y2: s.y2 + current.dy
+    }));
+    const found = actual.wires.filter((a: any) => a.net === w.net).flatMap((a: any) => segments(a.line));
+    if (
+      expected.some(
+        (s) => !found.some((a: Segment) => touch(a, { x: s.x1, y: s.y1 }) && touch(a, { x: s.x2, y: s.y2 }))
+      )
+    )
+      return `Wire copy readback failed: expected ${w.net} ${JSON.stringify(expected)}, found ${JSON.stringify(actual.wires.map((a: any) => ({ net: a.net, line: a.line })).slice(-8))}`;
+  }
+  return undefined;
+}
 export async function executeBlockTransfer(record: MutationRecord, api: () => EasyEdaApi) {
   const op = record.operation as any;
   const current = await plan(api, { ...op.params, target: record.target });
@@ -320,12 +324,17 @@ export async function executeBlockTransfer(record: MutationRecord, api: () => Ea
     createdWires: [],
     deletedComponents: [],
     deletedWires: [],
+    identityTransfers: [],
     phase: "copy"
   };
   op.progress = journal;
   try {
     await focusPage(api, current.destinationPageId, ctx.target.projectId!);
-    for (const c of current.components) {
+    for (let i = 0; i < current.components.length; i++) {
+      const c = current.components[i];
+      const tag = record.mutationId.replace(/-/g, "").slice(0, 12) + "_" + i;
+      const temporary = { designator: `X_MCP_C_${tag}`, uniqueId: `mcp-copy-${tag}` };
+      const retired = { designator: `X_MCP_S_${tag}`, uniqueId: `mcp-source-${tag}` };
       const created = await api().sch_PrimitiveComponent.create(
         current.devices[c.primitiveId],
         c.x + current.dx,
@@ -338,23 +347,15 @@ export async function executeBlockTransfer(record: MutationRecord, api: () => Ea
       );
       const id = created?.getState_PrimitiveId?.() ?? created?.primitiveId;
       if (!id) throw new Error(`No copy ID for ${c.designator}`);
-      journal.createdComponents.push({ sourceId: c.primitiveId, destinationId: id, designator: c.designator });
-      await api().sch_PrimitiveComponent.modify(id, props(c));
-      const attrs = toArray(await api().sch_PrimitiveAttribute.getAll(id)).filter(isRecord);
-      for (const old of current.attributes[c.primitiveId]) {
-        const match = attrs.filter((a) => a.key === old.key);
-        if (match.length !== 1) throw new Error(`Annotation key mismatch: ${old.key}`);
-        await api().sch_PrimitiveAttribute.modify(match[0].primitiveId, attributeProps(old, current.dx, current.dy));
-      }
-      const updated = toArray(await api().sch_PrimitiveAttribute.getAll(id)).filter(isRecord);
-      for (const old of current.attributes[c.primitiveId]) {
-        const match = updated.filter((a) => a.key === old.key);
-        if (
-          match.length !== 1 ||
-          canonicalJson(attributeProps(match[0])) !== canonicalJson(attributeProps(old, current.dx, current.dy))
-        )
-          throw new Error(`Annotation readback failed: ${old.key}`);
-      }
+      journal.createdComponents.push({
+        sourceId: c.primitiveId,
+        destinationId: id,
+        designator: c.designator,
+        temporary,
+        retired
+      });
+      await api().sch_PrimitiveComponent.modify(id, { ...props(c), ...temporary });
+      await restoreSchematicAttributes(api, id, current.attributes[c.primitiveId], current.dx, current.dy, temporary);
     }
     for (const w of current.wires) {
       const line = Array.isArray(w.line[0])
@@ -365,31 +366,56 @@ export async function executeBlockTransfer(record: MutationRecord, api: () => Ea
       if (!id) throw new Error("Wire copy returned no ID");
       journal.createdWires.push(id);
     }
-    const actual = await readPage(api);
-    for (const c of current.components) {
-      const copy = actual.components.find((d) => d.uniqueId === c.uniqueId);
-      if (
-        !copy ||
-        canonicalJson(identity(copy)) !== canonicalJson({ ...identity(c), x: c.x + current.dx, y: c.y + current.dy })
-      )
-        throw new Error(`Identity/footprint/property readback failed: ${c.designator}`);
-    }
-    for (const w of current.wires) {
-      const expected = segments(w.line).map((s) => ({
-        x1: s.x1 + current.dx,
-        y1: s.y1 + current.dy,
-        x2: s.x2 + current.dx,
-        y2: s.y2 + current.dy
-      }));
-      const found = actual.wires.filter((a) => a.net === w.net).flatMap((a) => segments(a.line));
-      if (expected.some((s) => !found.some((a) => touch(a, { x: s.x1, y: s.y1 }) && touch(a, { x: s.x2, y: s.y2 }))))
-        throw new Error("Wire copy readback failed");
-    }
+    // Native netlist collection also settles deferred net-name publication in v3.
+    if (api().sch_ManufactureData?.getNetlistFile) await collectNativeNetlist(api(), false);
+    const readbackDeadline = Date.now() + 1500;
+    let problem: string | undefined;
+    do {
+      problem = copyReadbackProblem(current, await readPage(api), journal);
+      if (!problem) break;
+      if (Date.now() >= readbackDeadline) throw new Error(problem);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (problem);
     journal.phase = "copy_verified";
     await focusPage(api, current.sourcePageId!, ctx.target.projectId!);
     const source = await readPage(api);
     if (canonicalJson(source) !== canonicalJson(current.source))
       throw new Error("Source changed during copy; preserved for inspection");
+    journal.phase = "retire_source_identity";
+    for (const c of current.components) {
+      const entry = journal.createdComponents.find((e: any) => e.sourceId === c.primitiveId);
+      journal.identityTransfers.push({
+        sourceId: c.primitiveId,
+        destinationId: entry.destinationId,
+        original: { designator: c.designator, uniqueId: c.uniqueId },
+        retired: entry.retired,
+        temporary: entry.temporary
+      });
+      await api().sch_PrimitiveComponent.modify(c.primitiveId, entry.retired);
+      const retired = (await readPage(api)).components.find((d) => d.primitiveId === c.primitiveId);
+      if (retired?.designator !== entry.retired.designator || retired?.uniqueId !== entry.retired.uniqueId)
+        throw new Error("Source identity retirement readback failed");
+    }
+    await focusPage(api, current.destinationPageId, ctx.target.projectId!);
+    journal.phase = "assign_destination_identity";
+    for (const c of current.components) {
+      const entry = journal.createdComponents.find((e: any) => e.sourceId === c.primitiveId);
+      await api().sch_PrimitiveComponent.modify(entry.destinationId, props(c));
+      await restoreSchematicAttributes(
+        api,
+        entry.destinationId,
+        current.attributes[c.primitiveId],
+        current.dx,
+        current.dy
+      );
+      const final = (await readPage(api)).components.find((d) => d.primitiveId === entry.destinationId);
+      if (
+        !final ||
+        canonicalJson(identity(final)) !== canonicalJson({ ...identity(c), x: c.x + current.dx, y: c.y + current.dy })
+      )
+        throw new Error("Final destination identity readback failed");
+    }
+    await focusPage(api, current.sourcePageId!, ctx.target.projectId!);
     journal.phase = "delete_source";
     for (const w of current.wires) {
       if ((await api().sch_PrimitiveWire.delete([w.primitiveId])) === false)

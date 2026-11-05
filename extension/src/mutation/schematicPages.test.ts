@@ -74,3 +74,56 @@ it("accepts EasyEDA's canonical lowercase page names without claiming a failed w
   const r = await executeSchematicPage(extensionMutations.get(String(p.mutationId)), f.api);
   expect(r.readback).toMatchObject({ name: "ph_isolated", verified: true });
 });
+
+it("uses native title-block API for sheet formatting instead of modifying a part", async () => {
+  const f = pageFixture();
+  f.components.p2.push({
+    primitiveId: "frame",
+    componentType: "sheet",
+    otherProperty: { "Page Size": "A4", Width: "1170", Height: "825" }
+  });
+  f.eda.dmt_Schematic.modifySchematicPageTitleBlock = vi.fn(async (_show: any, data: any) => {
+    Object.assign(f.components.p2[0].otherProperty, { "Page Size": data.Size.value, Width: "2339", Height: "1654" });
+    return true;
+  });
+  f.eda.sch_PrimitiveComponent.modify.mockRejectedValue(new Error("Only part components may be modified"));
+  const p = await prepareSchematicPage(f.api, { action: "format", pageId: "p2", format: "A2" });
+  const result = await executeSchematicPage(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(result.readback.verified).toBe(true);
+  expect(f.eda.dmt_Schematic.modifySchematicPageTitleBlock).toHaveBeenCalledWith(undefined, {
+    Size: { showTitle: false, showValue: false, value: "A2" }
+  });
+  expect(f.eda.sch_PrimitiveComponent.modify).not.toHaveBeenCalled();
+  expect(f.active()).toBe("p1");
+});
+it("waits for deferred native rename readback without repeating the write", async () => {
+  const f = pageFixture();
+  const original = f.eda.dmt_Schematic.getSchematicPageInfo;
+  let stale = 0;
+  f.eda.dmt_Schematic.getSchematicPageInfo = vi.fn(async (id: string) => {
+    const p = await original(id);
+    return ++stale === 1 ? { ...p, name: "old" } : p;
+  });
+  const p = await prepareSchematicPage(f.api, { action: "rename", pageId: "p2", name: "DOSERS" });
+  const r = await executeSchematicPage(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(r.readback.name).toBe("DOSERS");
+  expect(f.eda.dmt_Schematic.modifySchematicPageName).toHaveBeenCalledTimes(1);
+});
+
+it("verifies native rounded A2 dimensions even if the legacy Page Size attribute is stale", async () => {
+  const f = pageFixture();
+  f.components.p2.push({
+    primitiveId: "frame",
+    componentType: "sheet",
+    otherProperty: { "Page Size": "A4", Width: "1170", Height: "825" }
+  });
+  f.eda.dmt_Schematic.modifySchematicPageTitleBlock = vi.fn(async () => {
+    Object.assign(f.components.p2[0].otherProperty, { Width: "2338", Height: "1652" });
+    return true;
+  });
+  const p = await prepareSchematicPage(f.api, { action: "format", pageId: "p2", format: "A2" });
+  const r = await executeSchematicPage(extensionMutations.get(String(p.mutationId)), f.api);
+  expect(r.readback).toMatchObject({ format: "A2", verified: true });
+  const listed = await listSchematicPages(f.api, { includeCounts: true });
+  expect(listed.pages.find((p: any) => p.pageId === "p2").format).toBe("A2");
+});

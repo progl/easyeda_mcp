@@ -7,6 +7,47 @@ import { DefaultTimeoutSchema, DocumentTargetSchema, registerReadTool } from "./
 
 export function registerPcbTools(server: McpServer, bridge: EditorClient): void {
   registerReadTool(server, bridge, {
+    name: "easyeda_reconcile_explicit_unroute",
+    title: "Observe settled explicit unroute without retry",
+    description:
+      "Read-only observation of original selected IDs, new native geometry and protected inventory. Partial or old count-only evidence retains unknown; only complete authenticated native preservation proof can reconcile applied. Never deletes/replays or expands selection.",
+    method: "reconcileExplicitUnroute",
+    inputSchema: {
+      mutationId: z.string().min(1),
+      originalRecord: z.record(z.string(), z.unknown()).optional(),
+      timeoutMs: DefaultTimeoutSchema.default(60000)
+    },
+    summary: "Observed settled unroute without dispatching CAD writes."
+  });
+  server.registerTool(
+    "easyeda_prepare_mounting_holes",
+    {
+      title: "Prepare Round NPTH Mounting Holes",
+      description:
+        "Prepares round non-plated mounting holes through native multi-layer pads with empty nets and zero annular rings. No write until exact confirmed_action. Verify native drill export before manufacture.",
+      inputSchema: {
+        units: z.enum(["mil", "mm"]).default("mil"),
+        holes: z
+          .array(z.object({ x: z.number(), y: z.number(), diameter: z.number().positive() }))
+          .min(1)
+          .max(100),
+        target: DocumentTargetSchema.optional(),
+        timeoutMs: DefaultTimeoutSchema.default(30_000)
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+    },
+    async ({ timeoutMs, ...params }) => {
+      try {
+        return ok(
+          "Prepared NPTH holes; review preview and use exact confirmation via easyeda_confirmed_action.",
+          (await bridge.call("prepareMountingHoles", params, timeoutMs)) as Record<string, unknown>
+        );
+      } catch (error) {
+        return fail(error);
+      }
+    }
+  );
+  registerReadTool(server, bridge, {
     name: "easyeda_run_drc",
     title: "Run PCB Design Rule Check (DRC)",
     description:
@@ -58,7 +99,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     name: "easyeda_get_routing_status",
     title: "Get PCB Routing Status",
     description:
-      "Analyzes the PCB routing status, total nets, completion percentage, unrouted net connections (ratsnest), and optional net lengths.",
+      "Reads native PCB net names, observed track/via counts and optional net lengths. Completion and routed/unrouted counts remain null unless independently proven; net lengths and inferred ratsnest geometry are not connectivity or DRC proof.",
     method: "getRoutingStatus",
     inputSchema: {
       includeNetLengths: z.boolean().default(false).describe("Include calculated track length for each net."),
@@ -125,12 +166,18 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
       description:
         "Prepares a component transformation on the PCB (move, rotate, flip, or delete) with preview, scope, expected coordinates, and exact confirmation phrase. Does not modify the PCB until confirmed.",
       inputSchema: {
+        units: z
+          .enum(["mil", "mm"])
+          .default("mil")
+          .describe(
+            "Coordinate and length input units. Defaults to native mil; use mm explicitly for metric input. Preview/readback numeric coordinates remain native mil."
+          ),
         action: z.enum(["move", "rotate", "flip", "delete"]).describe("PCB component transform action to perform"),
         component: z.string().min(1).describe("Target component designator (e.g. 'U1', 'R3') or primitive ID"),
-        x: z.number().optional().describe("Absolute X target coordinate in mm (for move)"),
-        y: z.number().optional().describe("Absolute Y target coordinate in mm (for move)"),
-        dx: z.number().optional().describe("Relative X delta offset in mm (for move)"),
-        dy: z.number().optional().describe("Relative Y delta offset in mm (for move)"),
+        x: z.number().optional().describe("Absolute X target coordinate in selected units (for move)"),
+        y: z.number().optional().describe("Absolute Y target coordinate in selected units (for move)"),
+        dx: z.number().optional().describe("Relative X delta offset in selected units (for move)"),
+        dy: z.number().optional().describe("Relative Y delta offset in selected units (for move)"),
         rotation: z.number().optional().describe("Absolute rotation angle in degrees (for rotate)"),
         dRotation: z.number().optional().describe("Relative rotation angle increment in degrees (for rotate)"),
         layer: z.enum(["top", "bottom"]).optional().describe("Explicit target layer/side for flip"),
@@ -144,11 +191,11 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
         openWorldHint: false
       }
     },
-    async ({ action, component, x, y, dx, dy, rotation, dRotation, layer, target, timeoutMs }) => {
+    async ({ action, component, units, x, y, dx, dy, rotation, dRotation, layer, target, timeoutMs }) => {
       try {
         const result = (await bridge.call(
           "preparePcbComponent",
-          { action, component, x, y, dx, dy, rotation, dRotation, layer, target },
+          { action, component, units, x, y, dx, dy, rotation, dRotation, layer, target },
           timeoutMs
         )) as Record<string, unknown>;
 
@@ -192,29 +239,45 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
       description:
         "Prepares creation, rectangular/polygonal sizing, clearing, or segment modification of the board outline on the active PCB. Returns a mutationId and exact confirmation phrase required for execution via easyeda_confirmed_action.",
       inputSchema: {
+        units: z
+          .enum(["mil", "mm"])
+          .default("mil")
+          .describe(
+            "Coordinate and length input units. Defaults to native mil; use mm explicitly for metric input. Preview/readback numeric coordinates remain native mil."
+          ),
         action: z
           .enum(["set_rectangle", "create", "set_polygon", "clear", "modify_segment"])
           .default("set_rectangle")
-          .describe("Board outline mutation action to perform."),
-        x: z.number().default(0).describe("Origin X coordinate in mm (for set_rectangle / create)."),
-        y: z.number().default(0).describe("Origin Y coordinate in mm (for set_rectangle / create)."),
-        width: z.number().positive().optional().describe("Board width in mm (for set_rectangle / create)."),
-        height: z.number().positive().optional().describe("Board height in mm (for set_rectangle / create)."),
+          .describe(
+            "Board outline action. create is create-only: refuses an existing outline, including changes after preview."
+          ),
+        x: z.number().default(0).describe("Origin X coordinate in selected units (for set_rectangle / create)."),
+        y: z.number().default(0).describe("Origin Y coordinate in selected units (for set_rectangle / create)."),
+        width: z.number().positive().optional().describe("Board width in selected units (for set_rectangle / create)."),
+        height: z
+          .number()
+          .positive()
+          .optional()
+          .describe("Board height in selected units (for set_rectangle / create)."),
         points: z
           .array(z.object({ x: z.number(), y: z.number() }))
           .min(3)
           .optional()
-          .describe("Array of vertex coordinates in mm for polygonal outline (for set_polygon)."),
-        lineWidth: z.number().positive().default(0.2).describe("Outline track line width in mm (default: 0.2)."),
+          .describe("Array of vertex coordinates in selected units for polygonal outline (for set_polygon)."),
+        lineWidth: z
+          .number()
+          .positive()
+          .default(0.2)
+          .describe("Outline track line width in selected units (default: 0.2)."),
         clearExisting: z
           .boolean()
           .default(true)
           .describe("Whether to delete existing board outline primitives before creating new ones."),
         primitiveId: z.string().optional().describe("Target segment primitive ID (for modify_segment)."),
-        startX: z.number().optional().describe("New start X coordinate in mm (for modify_segment)."),
-        startY: z.number().optional().describe("New start Y coordinate in mm (for modify_segment)."),
-        endX: z.number().optional().describe("New end X coordinate in mm (for modify_segment)."),
-        endY: z.number().optional().describe("New end Y coordinate in mm (for modify_segment)."),
+        startX: z.number().optional().describe("New start X coordinate in selected units (for modify_segment)."),
+        startY: z.number().optional().describe("New start Y coordinate in selected units (for modify_segment)."),
+        endX: z.number().optional().describe("New end X coordinate in selected units (for modify_segment)."),
+        endY: z.number().optional().describe("New end Y coordinate in selected units (for modify_segment)."),
         target: DocumentTargetSchema.optional().describe("Expected active PCB target."),
         timeoutMs: DefaultTimeoutSchema.default(30_000)
       },
@@ -227,6 +290,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     },
     async ({
       action,
+      units,
       x,
       y,
       width,
@@ -247,6 +311,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
           "prepareBoardOutline",
           {
             action,
+            units,
             x,
             y,
             width,
@@ -287,7 +352,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     {
       title: "Prepare PCB Auto-routing or Unrouting",
       description:
-        "Prepares native auto-routing or destructive unrouting of tracks/vias on the active PCB canvas with explicit nets scope, safety preview, and exact confirmation phrase. Does not modify the PCB until confirmed.",
+        "Prepares native auto-routing or explicit-ID destructive unrouting with exact confirmation. Unroute requires trackIds/viaIds (1–5000 total), snapshots protected inventory, deletes native batches of at most 250 within 40 seconds, and verifies independent readback; net-based clearing is unavailable. Native autoRouting may run for 900 seconds; the bridge deadline does not cancel it. Query the same mutationId after unknown, never automatically replay. A settled native result is not independent completion or DRC proof. Direct legacy nativeAutoRoute is blocked; use this staged mutation.",
       inputSchema: {
         action: z
           .enum(["autoroute", "unroute"])
@@ -295,7 +360,23 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
         nets: z
           .array(z.string())
           .optional()
-          .describe("Explicit array of net names to target (e.g. ['GND', 'VCC']). If omitted, targets all nets."),
+          .describe(
+            "Autoroute net selection. Unroute instead requires explicit trackIds/viaIds and rejects nonempty nets."
+          ),
+        trackIds: z
+          .array(z.string().min(1).max(512))
+          .max(5000)
+          .optional()
+          .describe(
+            "Explicit native Line IDs to delete for unroute. Maximum 5000 selected track+via IDs total; every ID is read and checked before writing."
+          ),
+        viaIds: z
+          .array(z.string().min(1).max(512))
+          .max(5000)
+          .optional()
+          .describe(
+            "Explicit native Via IDs to delete for unroute. Unselected vias/components/pad-netmaps are snapshotted and independently preserved."
+          ),
         ignoreNets: z.array(z.string()).optional().describe("Array of net names to exclude from autorouting."),
         keepExistingRoutes: z
           .boolean()
@@ -311,11 +392,19 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
         openWorldHint: false
       }
     },
-    async ({ action, nets, ignoreNets, keepExistingRoutes, target, timeoutMs }) => {
+    async ({ action, nets, trackIds, viaIds, ignoreNets, keepExistingRoutes, target, timeoutMs }) => {
       try {
         const result = (await bridge.call(
           "preparePcbRouting",
-          { action, nets, ignoreNets, keepExistingRoutes, target },
+          {
+            action,
+            nets,
+            ignoreNets,
+            keepExistingRoutes,
+            target,
+            ...(trackIds !== undefined ? { trackIds } : {}),
+            ...(viaIds !== undefined ? { viaIds } : {})
+          },
           timeoutMs
         )) as Record<string, unknown>;
 
@@ -399,7 +488,13 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
         .optional()
         .describe("Optional filter by layer name or layer ID (e.g. 1, 'TopLayer', 2, 'BottomLayer')."),
       primitiveId: z.string().min(1).optional().describe("Optional filter by track primitive ID."),
-      limit: z.number().int().positive().max(500).default(100).describe("Maximum number of tracks to return."),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(5000)
+        .default(100)
+        .describe("Maximum number of tracks to return; up to 5000 for explicit inventory requests."),
       includeRaw: z.boolean().default(false).describe("Include raw underlying primitive data."),
       target: DocumentTargetSchema.optional(),
       timeoutMs: DefaultTimeoutSchema.default(30_000)
@@ -416,7 +511,13 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     inputSchema: {
       net: z.string().min(1).optional().describe("Optional filter by net name (e.g. 'GND', 'VCC')."),
       primitiveId: z.string().min(1).optional().describe("Optional filter by via primitive ID."),
-      limit: z.number().int().positive().max(500).default(100).describe("Maximum number of vias to return."),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(5000)
+        .default(100)
+        .describe("Maximum number of vias to return; up to 5000 for explicit inventory requests."),
       includeRaw: z.boolean().default(false).describe("Include raw underlying primitive data."),
       target: DocumentTargetSchema.optional(),
       timeoutMs: DefaultTimeoutSchema.default(30_000)
@@ -431,6 +532,12 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
       description:
         "Prepares creating, modifying, or destructively deleting copper tracks and vias on the active PCB canvas with safety preview and exact confirmation phrase. Does not modify the PCB until confirmed.",
       inputSchema: {
+        units: z
+          .enum(["mil", "mm"])
+          .default("mil")
+          .describe(
+            "Coordinate and length input units. Defaults to native mil; use mm explicitly for metric input. Preview/readback numeric coordinates remain native mil."
+          ),
         entity: z.enum(["track", "via"]).describe("Entity type to mutate: 'track' or 'via'."),
         action: z.enum(["create", "modify", "delete"]).describe("Action: 'create', 'modify', or 'delete'."),
         trackId: z.string().min(1).optional().describe("Primitive ID of track to modify or delete."),
@@ -440,15 +547,19 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
           .union([z.string(), z.number()])
           .optional()
           .describe("Placement layer for created track (default: 1 / TopLayer)."),
-        startX: z.number().optional().describe("Start X coordinate in mm (for track creation)."),
-        startY: z.number().optional().describe("Start Y coordinate in mm (for track creation)."),
-        endX: z.number().optional().describe("End X coordinate in mm (for track creation)."),
-        endY: z.number().optional().describe("End Y coordinate in mm (for track creation)."),
-        lineWidth: z.number().positive().optional().describe("Track line width in mm (default: 0.254)."),
-        x: z.number().optional().describe("Center X coordinate in mm (for via creation)."),
-        y: z.number().optional().describe("Center Y coordinate in mm (for via creation)."),
-        diameter: z.number().positive().optional().describe("Via outer diameter in mm (default: 0.6)."),
-        holeDiameter: z.number().positive().optional().describe("Via drill hole diameter in mm (default: 0.3)."),
+        startX: z.number().optional().describe("Start X coordinate in selected units (for track creation)."),
+        startY: z.number().optional().describe("Start Y coordinate in selected units (for track creation)."),
+        endX: z.number().optional().describe("End X coordinate in selected units (for track creation)."),
+        endY: z.number().optional().describe("End Y coordinate in selected units (for track creation)."),
+        lineWidth: z.number().positive().optional().describe("Track line width in selected units (default: 0.254)."),
+        x: z.number().optional().describe("Center X coordinate in selected units (for via creation)."),
+        y: z.number().optional().describe("Center Y coordinate in selected units (for via creation)."),
+        diameter: z.number().positive().optional().describe("Via outer diameter in selected units (default: 0.6)."),
+        holeDiameter: z
+          .number()
+          .positive()
+          .optional()
+          .describe("Via drill hole diameter in selected units (default: 0.3)."),
         properties: z
           .record(z.string(), z.unknown())
           .optional()
@@ -565,6 +676,14 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
         height: z.number().positive().optional().describe("Shortcut height in mm for rectangular area."),
         clearance: z.number().positive().optional().describe("Clearance spacing in mm (for copper zones)."),
         fillType: z.string().optional().describe("Fill style for copper zones: 'solid', 'grid', or 'none'."),
+        pourPriority: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Native pour list insertion position for create. Smaller effective orders have higher precedence; requested positions clamp to the list, so inspect observed readback. Zero is unsupported because the installed SDK cannot verify it. For modify use properties.pourPriority."
+          ),
         keepoutType: z.string().optional().describe("Keepout restriction type: 'all', 'track', 'via', 'copper', etc."),
         properties: z
           .record(z.string(), z.unknown())
@@ -623,7 +742,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     name: "easyeda_get_pcb_placement_report",
     title: "Get PCB component placement and collision report",
     description:
-      "Generates a comprehensive component placement report including density, bounding boxes, layer distribution, and collision/clearance warnings.",
+      "Reports millimetre dimensions converted from native mil, using actual pad envelopes or explicit component dimensions. Missing geometry is reported, never replaced with 2x2 sizes. Bounding-box checks do not verify body/courtyard clearances.",
     method: "getPcbPlacementReport",
     inputSchema: {
       collisionTolerance: z

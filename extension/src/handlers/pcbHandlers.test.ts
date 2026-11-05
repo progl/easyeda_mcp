@@ -116,7 +116,9 @@ describe("Extension PCB Handlers - Pads and Components", () => {
         getAllNetsName: vi.fn(async () => ["GND", "VCC"])
       },
       pcb_Drc: {
-        check: vi.fn(async (): Promise<any> => []),
+        check: vi.fn(async (_strict?: boolean, _ui?: boolean, verbose?: boolean): Promise<any> =>
+          verbose ? [] : true
+        ),
         getDrcErrors: vi.fn(async (): Promise<any> => []),
         getCurrentRuleConfiguration: vi.fn(async (): Promise<any> => ({ name: "DefaultRules" }))
       }
@@ -124,6 +126,19 @@ describe("Extension PCB Handlers - Pads and Components", () => {
   }
 
   describe("normalizePcbPad", () => {
+    it("reads native mil pad shapes and uses SDK multi-layer12 rather than board-outline11", () => {
+      const pad = normalizePcbPad({ x: 1000, y: -500, layer: 12, pad: ["RECT", 100, 60, 0], hole: ["ROUND", 30] });
+      expect(pad).toMatchObject({
+        x: 1000,
+        y: -500,
+        width: 100,
+        height: 60,
+        holeDiameter: 30,
+        isThroughHole: true,
+        units: "mil"
+      });
+      expect(normalizePcbPad({ layer: 11 }).isThroughHole).toBe(false);
+    });
     it("normalizes SMD pad with side, net, and dimensions", () => {
       const raw = {
         primitiveId: "pad-1",
@@ -280,6 +295,71 @@ describe("Extension PCB Handlers - Pads and Components", () => {
   });
 
   describe("runDrc", () => {
+    it("requests native verbose groups and normalizes actual leaf evidence", async () => {
+      const api = makeMockApi();
+      api.pcb_Drc.check = vi.fn(async () => [
+        {
+          name: "Clearance Error",
+          list: [
+            {
+              name: "Track to Track",
+              list: [
+                {
+                  errorType: "Clearance Error",
+                  ruleTypeName: "Clearance",
+                  ruleName: "Power",
+                  objs: ["trackA", "trackB"],
+                  net: "VM",
+                  layer: "Top",
+                  pos: { x: 12, y: 34 },
+                  explanation: {
+                    str: "distance {minDistance}, should be {shouldBe}",
+                    param: { minDistance: "0.12mm", shouldBe: ">= 0.2mm" }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]);
+      const result: any = await createPcbHandlers(() => api).runDrc({});
+      expect(api.pcb_Drc.check).toHaveBeenCalledExactlyOnceWith(true, false, true);
+      expect(result.violationsCount).toBe(1);
+      expect(result.violations[0]).toMatchObject({
+        primitiveIds: ["trackA", "trackB"],
+        nets: ["VM"],
+        layer: "Top",
+        coordinates: { x: 12, y: 34 },
+        message: "distance 0.12mm, should be >= 0.2mm",
+        code: "Clearance",
+        evidence: { actual: "0.12mm", expected: ">= 0.2mm" }
+      });
+    });
+    it("requires a successful boolean control after empty native verbose groups", async () => {
+      const api = makeMockApi();
+      api.pcb_Drc.check = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(false);
+      const result: any = await createPcbHandlers(() => api).runDrc({});
+      expect(api.pcb_Drc.check.mock.calls).toEqual([
+        [true, false, true],
+        [true, false, false]
+      ]);
+      expect(result.passed).not.toBe(true);
+      expect(result.status).toBe("inconclusive");
+      expect(result.nativeEvidence.detailsUnavailable).toBe(true);
+    });
+
+    it("does not pass a legacy boolean true or an empty verbose result whose control throws", async () => {
+      const api = makeMockApi();
+      api.pcb_Drc.check = vi.fn(async () => true) as any;
+      const first: any = await createPcbHandlers(() => api).runDrc({});
+      expect(first.passed).toBe(false);
+      expect(first.status).toBe("inconclusive");
+      api.pcb_Drc.check = vi.fn().mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("worker unavailable"));
+      const second: any = await createPcbHandlers(() => api).runDrc({});
+      expect(second.passed).toBe(false);
+      expect(second.status).toBe("inconclusive");
+      expect(second.nativeEvidence.controlError).toContain("worker unavailable");
+    });
     it("executes DRC returning zero violations and passed=true", async () => {
       const mockApi = makeMockApi();
       const handlers = createPcbHandlers(() => mockApi);
@@ -379,7 +459,7 @@ describe("Extension PCB Handlers - Pads and Components", () => {
       expect(result.summary.byCategory.Silkscreen).toBe(1);
     });
 
-    it("handles boolean false result with fallback error violation", async () => {
+    it("reports legacy boolean failure without inventing a violation", async () => {
       const mockApi = makeMockApi();
       mockApi.pcb_Drc.check = vi.fn(async () => false);
 
@@ -387,9 +467,10 @@ describe("Extension PCB Handlers - Pads and Components", () => {
       const result = (await handlers.runDrc({})) as any;
 
       expect(result.passed).toBe(false);
-      expect(result.errorsCount).toBe(1);
-      expect(result.violations).toHaveLength(1);
-      expect(result.violations[0].message).toContain("Native PCB DRC check failed");
+      expect(result.errorsCount).toBe(0);
+      expect(result.violations).toHaveLength(0);
+      expect(result.status).toBe("inconclusive");
+      expect(result.nativeEvidence.legacyBooleanResult).toBe(false);
     });
 
     it("filters violations by severity and rule code", async () => {
@@ -465,5 +546,28 @@ describe("Extension PCB Handlers - Pads and Components", () => {
         })
       ).rejects.toThrow("Active document");
     });
+  });
+});
+
+it("public routing status never derives completion from positive lengths or synthetic net flags", async () => {
+  const eda: any = {
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "p", documentType: 3 }) },
+    pcb_Net: {
+      getAllNetsName: async () => ["GND"],
+      getAllNets: async () => [{ net: "GND", length: 100, isRouted: true }],
+      getNetLength: async () => 100
+    }
+  };
+  const r: any = await createPcbHandlers(() => eda).getRoutingStatus({
+    includeNetLengths: true,
+    target: { documentId: "p" }
+  });
+  expect(r).toMatchObject({
+    totalNets: 1,
+    routedNets: null,
+    completionPercent: null,
+    verified: false,
+    netLengths: { GND: 100 },
+    status: "inconclusive"
   });
 });

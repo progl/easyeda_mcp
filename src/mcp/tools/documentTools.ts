@@ -3,8 +3,56 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import type { EditorClient } from "../../editor/EditorClient.js";
 import { DefaultTimeoutSchema, DocumentTargetSchema } from "./common.js";
 import { fail, ok } from "../toolResult.js";
+import { BridgeTimeoutError, BridgeUnavailableError } from "../../bridge/errors.js";
 
 export function registerDocumentTools(server: McpServer, bridge: EditorClient): void {
+  server.registerTool(
+    "easyeda_refresh_document_view",
+    {
+      title: "Refresh Saved Document View",
+      description:
+        "Saves the explicit active schematic/PCB target, requires native save=true, closes its single tab once, waits for verified tab removal, reopens it once and verifies project/document. May refresh a stale canvas without browser reload. Does not verify rendered pixels. Never automatically retry an unknown outcome.",
+      inputSchema: {
+        target: DocumentTargetSchema.extend({
+          projectId: z.string().min(1),
+          documentId: z.string().min(1),
+          documentType: z.enum(["schematic", "pcb"])
+        }),
+        timeoutMs: z.number().int().min(200).max(120000).default(30000)
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+    },
+    async ({ target, timeoutMs }) => {
+      try {
+        const result = (await bridge.call("refreshDocumentView", { target, timeoutMs }, timeoutMs)) as Record<
+          string,
+          unknown
+        >;
+        const response = ok(
+          result.status === "refreshed"
+            ? "Saved document reopened; inspect the rendered canvas separately."
+            : "Document refresh outcome is uncertain; inspect tabs before recovery.",
+          result
+        );
+        if (result.status !== "refreshed") response.isError = true;
+        return response;
+      } catch (error) {
+        if (error instanceof BridgeTimeoutError || error instanceof BridgeUnavailableError) {
+          const response = ok("Refresh outcome is unknown; do not repeat save/close/open automatically.", {
+            status: "unknown",
+            retryable: false,
+            phase: "transport",
+            visualRenderVerified: false,
+            nextSteps: ["Inspect current target and document tabs before recovery."]
+          });
+          response.isError = true;
+          return response;
+        }
+        return fail(error);
+      }
+    }
+  );
+
   server.registerTool(
     "easyeda_list_documents",
     {

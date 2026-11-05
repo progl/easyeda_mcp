@@ -239,7 +239,8 @@ export async function prepareSchematicWireMutation(
     const operation = {
       action: "modifyWire",
       wireId,
-      properties
+      properties,
+      baseline: existingWire
     };
 
     const before: Record<string, unknown> = {
@@ -438,15 +439,36 @@ export async function executeSchematicWireMutation(
 
   if (op.action === "modifyWire") {
     ensureApi("sch_PrimitiveWire", "modify", eda);
-    await eda.sch_PrimitiveWire.modify(op.wireId, op.properties);
-
+    const baseline = op.baseline;
+    if (!baseline) throw apiError("stale_mutation", "Wire preview has no complete baseline; prepare it again.");
+    if (canonicalJson(await findWireById(api, op.wireId)) !== canonicalJson(baseline))
+      throw apiError("stale_mutation", "Wire properties changed after preview; no write performed.");
+    const patch = {
+      line: op.properties.coordinates ?? baseline.line,
+      net: op.properties.net ?? baseline.net,
+      color: op.properties.color ?? baseline.color,
+      lineWidth: op.properties.lineWidth ?? baseline.lineWidth,
+      lineType: baseline.lineType
+    };
+    const canonicalLine = (line: unknown) => {
+      const points = extractPointsFromFlat(normalizeLineCoordinates(line));
+      const forward = canonicalJson(points),
+        reverse = canonicalJson([...points].reverse());
+      return forward < reverse ? forward : reverse;
+    };
+    const matches = (wire: Record<string, unknown>) =>
+      canonicalLine(wire.line) === canonicalLine(patch.line) &&
+      ["net", "color", "lineWidth", "lineType"].every((key) => wire[key] === patch[key as keyof typeof patch]);
     try {
-      const wire = await findWireById(api, op.wireId);
-      if (op.properties.net !== undefined && wire.net !== op.properties.net) {
-        throw apiError("readback_verification_failed", `Wire ${op.wireId} net does not match the requested name.`, {
-          expected: op.properties.net,
-          actual: wire.net
-        });
+      // The SDK replaces a wire and dispatches persistence without awaiting it.
+      // Supply every stored field and poll getters; never replay modify/done.
+      await eda.sch_PrimitiveWire.modify(op.wireId, patch);
+      const deadline = Date.now() + 1500;
+      let wire = await findWireById(api, op.wireId);
+      while (!matches(wire)) {
+        if (Date.now() >= deadline) throw new Error(`Wire ${op.wireId} geometry/net/style readback did not match.`);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        wire = await findWireById(api, op.wireId);
       }
       const points = op.properties.coordinates ? extractPointsFromFlat(op.properties.coordinates) : [];
       const affectedConnections = points.length > 0 ? await findTouchingConnections(api, points) : [];

@@ -14,6 +14,16 @@ describe("Schematic Component Mutations", () => {
   });
 
   describe("findComponentInSchematic", () => {
+    it("resolves only current-page parts when copied boards reuse IDs and designators", async () => {
+      const other = { primitiveId: "shared-id", designator: "U_WEIGHT", x: 10, y: 20 };
+      const current = { primitiveId: "shared-id", designator: "U_WEIGHT", x: 550, y: 400 };
+      const getAll = vi.fn(async (_: unknown, allPages: boolean) => (allPages ? [other, current] : [current]));
+      const api = () => ({ sch_PrimitiveComponent: { getAll } });
+      expect((await findComponentInSchematic(api, "shared-id")).x).toBe(550);
+      expect((await findComponentInSchematic(api, "U_WEIGHT")).y).toBe(400);
+      expect(getAll).toHaveBeenCalledWith(undefined, false);
+    });
+
     it("resolves component by primitiveId and by designator case-insensitively", async () => {
       const api = () => ({
         sch_PrimitiveComponent: {
@@ -166,6 +176,115 @@ describe("Schematic Component Mutations", () => {
   });
 
   describe("executeSchematicComponentMutation & ActionHandler integration", () => {
+    it.each([true, false])(
+      "assigns explicit uniqueId with one modify and independent readback (persist=%s)",
+      async (persist) => {
+        let row: any;
+        const modify = vi.fn(async (_id, patch) => {
+          if (persist) Object.assign(row, patch);
+        });
+        const create = vi.fn(async () => {
+          row = { primitiveId: "created", x: 1, y: 2, uniqueId: "" };
+          return { primitiveId: "created", uniqueId: "requested" };
+        });
+        const api = () => ({
+          dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "sch-doc-1", documentType: 1 }) },
+          sch_PrimitiveComponent: { create, modify, getAll: async () => (row ? [row] : []) }
+        });
+        const prep = await prepareSchematicComponentMutation(api, {
+          action: "create",
+          device: { uuid: "a".repeat(32), libraryUuid: "b".repeat(32) },
+          x: 1,
+          y: 2,
+          uniqueId: "requested",
+          designator: "R9"
+        });
+        expect((prep.preview as any).requestedAfter.uniqueId).toBe("requested");
+        const handlers = createActionHandlers(api, new DrcRules(api));
+        const result: any = await handlers.confirmedAction({
+          action: "mutation",
+          confirmation: prep.confirmation,
+          params: { mutationId: prep.mutationId }
+        });
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(modify).toHaveBeenCalledExactlyOnceWith("created", { designator: "R9", uniqueId: "requested" });
+        expect(result.status).toBe(persist ? "applied" : "unknown");
+        if (persist) expect(result.after.uniqueId).toBe("requested");
+        else {
+          await Promise.resolve(
+            handlers.confirmedAction({
+              action: "mutation",
+              confirmation: prep.confirmation,
+              params: { mutationId: prep.mutationId }
+            })
+          ).catch(() => {});
+          expect(create).toHaveBeenCalledTimes(1);
+        }
+      }
+    );
+
+    it.each([true])(
+      "reads public getter when sandbox Function constructor is unavailable (persist=%s)",
+      async (persist) => {
+        let row: any;
+        const modify = vi.fn(async (_id, patch) => {
+          if (persist) Object.assign(row, patch);
+        });
+        const create = vi.fn(async () => {
+          row = {
+            primitiveId: "created",
+            x: 1,
+            y: 2,
+            uniqueId: "",
+            getState_UniqueId() {
+              return this.uniqueId;
+            }
+          };
+          return { primitiveId: "created", uniqueId: "requested" };
+        });
+        const api = () => ({
+          dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "sch-doc-1", documentType: 1 }) },
+          sch_PrimitiveComponent: { create, modify, getAll: async () => (row ? [row] : []) }
+        });
+        const prep = await prepareSchematicComponentMutation(api, {
+          action: "create",
+          device: { uuid: "a".repeat(32), libraryUuid: "b".repeat(32) },
+          x: 1,
+          y: 2,
+          uniqueId: "requested",
+          designator: "R9"
+        });
+        expect((prep.preview as any).requestedAfter.uniqueId).toBe("requested");
+        const handlers = createActionHandlers(api, new DrcRules(api));
+        const nativeFunction = globalThis.Function;
+        let result: any;
+        try {
+          (globalThis as any).Function = undefined;
+          result = await handlers.confirmedAction({
+            action: "mutation",
+            confirmation: prep.confirmation,
+            params: { mutationId: prep.mutationId }
+          });
+        } finally {
+          globalThis.Function = nativeFunction;
+        }
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(modify).toHaveBeenCalledExactlyOnceWith("created", { designator: "R9", uniqueId: "requested" });
+        expect(result.status).toBe(persist ? "applied" : "unknown");
+        if (persist) expect(result.after.uniqueId).toBe("requested");
+        else {
+          await Promise.resolve(
+            handlers.confirmedAction({
+              action: "mutation",
+              confirmation: prep.confirmation,
+              params: { mutationId: prep.mutationId }
+            })
+          ).catch(() => {});
+          expect(create).toHaveBeenCalledTimes(1);
+        }
+      }
+    );
+
     it("executes createComponent mutation and verifies readback", async () => {
       let createdDoc: any = null;
       const api = () => ({
@@ -177,7 +296,13 @@ describe("Schematic Component Mutations", () => {
           }))
         },
         lib_Device: {
-          search: vi.fn(async () => [{ uuid: "dev-c1523", name: "10k 0603" }])
+          search: vi.fn(async () => [
+            {
+              uuid: "710b598d5efc4c77bd86ae62b6b33075",
+              libraryUuid: "0819f05c4eef4c71ace90d822a990e87",
+              name: "10k 0603"
+            }
+          ])
         },
         sch_PrimitiveComponent: {
           getAll: vi.fn(async () => (createdDoc ? [createdDoc] : [])),
@@ -297,5 +422,47 @@ describe("Schematic Component Mutations", () => {
       });
       expect(components).toHaveLength(0);
     });
+  });
+  it("rejects a cached project component reference before SDK create or library lookup", async () => {
+    const create = vi.fn(),
+      get = vi.fn(),
+      api = () => ({
+        dmt_SelectControl: {
+          getCurrentDocumentInfo: async () => ({ uuid: "sch", parentProjectUuid: "p", documentType: 1 })
+        },
+        sch_PrimitiveComponent: { create },
+        lib_Device: { get }
+      });
+    await expect(
+      prepareSchematicComponentMutation(api, {
+        action: "create",
+        device: {
+          libraryUuid: "0819f05c4eef4c71ace90d822a990e87",
+          uuid: "872f61e794230495",
+          name: "B3B-PH-K-S(LF)(SN)"
+        },
+        x: 1,
+        y: 2
+      })
+    ).rejects.toThrow(/catalog|cached|32/i);
+    expect(create).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+  it("also rejects a legacy prepared invalid reference at execution without dispatching SDK create", async () => {
+    const create = vi.fn();
+    await expect(
+      executeSchematicComponentMutation(
+        {
+          operation: {
+            action: "createComponent",
+            device: { uuid: "872f61e794230495", libraryUuid: "0819f05c4eef4c71ace90d822a990e87" },
+            x: 1,
+            y: 2
+          }
+        } as any,
+        () => ({ sch_PrimitiveComponent: { create } })
+      )
+    ).rejects.toThrow(/catalog|cached|32/i);
+    expect(create).not.toHaveBeenCalled();
   });
 });

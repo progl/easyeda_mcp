@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { pageFixture } from "../mutation/schematicPageFixture.js";
 import { auditSchematicConnectivity } from "./schematicConnectivity.js";
 import { applyNativeNetlist } from "../../../src/schematic/nativeNetlist.js";
@@ -43,6 +43,31 @@ describe("native JSON and interpage connectivity", () => {
 });
 
 import { collectSchematicSnapshot } from "./schematicHandlers.js";
+it("passes the explicit native read budget through all-page snapshots with provenance", async () => {
+  vi.useFakeTimers();
+  try {
+    const f = pageFixture();
+    f.eda.sch_ManufactureData = {
+      getNetlistFile: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        return { text: async () => "(\nGND\nR1-1\n)" };
+      }
+    };
+    const pending = collectSchematicSnapshot(f.api, {
+      allPages: true,
+      includeRaw: false,
+      nativeNetlistTimeoutMs: 8000
+    });
+    await vi.advanceTimersByTimeAsync(4500);
+    const result = await pending;
+    expect(result.pins[0]).toMatchObject({ net: "GND", netSource: "native_netlist" });
+    expect(result.nativeNetlist).toMatchObject({ status: "available", read: { timeoutMs: 8000, timedOut: false } });
+    expect(f.active()).toBe("p1");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("does not infer cross-page connections from identical coordinates in a multi-page snapshot", async () => {
   const f = pageFixture();
   f.components.p2.push({ ...f.components.p1[0], primitiveId: "c1", designator: "R2", uniqueId: "uid2" });
@@ -51,4 +76,7 @@ it("does not infer cross-page connections from identical coordinates in a multi-
   expect(s.pins.every((p) => !p.net)).toBe(true);
   expect(new Set(s.pins.map((p) => p.componentPrimitiveId)).size).toBe(2);
   expect(f.active()).toBe("p1");
+  expect(s.warnings).toContain(
+    "Native connectivity was not obtained. Multi-page geometry is omitted; zero nets and unknown pins do not prove an empty or disconnected circuit."
+  );
 });

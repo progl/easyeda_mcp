@@ -49,7 +49,17 @@ export function registerSchematicPageTools(server: McpServer, bridge: EditorClie
       method: "auditSchematicConnectivity",
       description:
         "Reads each page of the active schematic and audits exact native pin-net membership, duplicate references, unknown pins and interpage nets. Namespaces page-local IDs, restores focus; does not treat geometric guesses as native verification.",
-      schema: { target: DocumentTargetSchema.optional(), timeoutMs: DefaultTimeoutSchema.default(60000) }
+      schema: {
+        target: DocumentTargetSchema.optional(),
+        nativeNetlistTimeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .max(20000)
+          .default(3000)
+          .describe("Native netlist export/read budget; separate from transport timeoutMs, at most 20000 ms."),
+        timeoutMs: DefaultTimeoutSchema.default(60000)
+      }
     }
   ];
   for (const spec of specs)

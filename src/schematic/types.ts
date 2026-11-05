@@ -86,6 +86,8 @@ export type SchematicSnapshot = {
     matchedPins: number;
     conflicts: number;
     reason?: string;
+    read?: NativeNetlistData["read"];
+    scope?: NativeNetlistData["scope"];
   };
   snapshotId?: string;
   target?: DocumentIdentity;

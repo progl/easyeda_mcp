@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fail, ok } from "./toolResult.js";
+import { fail, ok, mutationOk } from "./toolResult.js";
 
 describe("toolResult", () => {
   it("includes structured payload inside text content for success results", () => {
@@ -32,5 +32,21 @@ describe("toolResult", () => {
       error: "unexpected_error",
       message: "boom"
     });
+  });
+  it("keeps complete recovery data structured while rendering a bounded mutation summary", () => {
+    const record = {
+      mutationId: "m1",
+      status: "unknown",
+      phase: "settled",
+      error: "short diagnostic",
+      operation: { before: "private-heavy-state".repeat(10000) },
+      after: { verified: false, journal: Array(200).fill("wire-id") }
+    };
+    const full = { action: "mutation", result: record };
+    const result = mutationOk("Mutation outcome", full, record);
+    expect(result.structuredContent).toBe(full);
+    expect((result.content[0] as any).text).toContain("short diagnostic");
+    expect((result.content[0] as any).text).not.toContain("private-heavy-state");
+    expect((result.content[0] as any).text.length).toBeLessThan(1000);
   });
 });

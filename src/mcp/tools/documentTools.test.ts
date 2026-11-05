@@ -194,4 +194,24 @@ describe("Document MCP Tools", () => {
       content: [{ type: "text", text: expect.stringContaining("not supported") }]
     });
   });
+  it("registers refresh as a non-read-only operation and forwards explicit target/timeout", async () => {
+    const bridge = {
+      endpoint: "ws://127.0.0.1:8765",
+      getStatus: (): EditorStatus => ({ connected: true, updatedAt: new Date().toISOString() }),
+      call: vi.fn(async () => ({ status: "refreshed", saveVerified: true, visualRenderVerified: false }))
+    };
+    const client = await makeClient(bridge),
+      tools = await client.listTools();
+    const tool = tools.tools.find((t) => t.name === "easyeda_refresh_document_view");
+    expect(tool?.annotations).toMatchObject({ readOnlyHint: false, idempotentHint: false });
+    await client.callTool({
+      name: "easyeda_refresh_document_view",
+      arguments: { target: { projectId: "p", documentId: "doc", documentType: "schematic" }, timeoutMs: 5000 }
+    });
+    expect(bridge.call).toHaveBeenCalledWith(
+      "refreshDocumentView",
+      { target: { projectId: "p", documentId: "doc", documentType: "schematic" }, timeoutMs: 5000 },
+      5000
+    );
+  });
 });

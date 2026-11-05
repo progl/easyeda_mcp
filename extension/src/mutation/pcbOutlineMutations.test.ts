@@ -20,28 +20,28 @@ describe("PCB Board Outline Mutations & Inspection", () => {
         pcb_Layer: {
           getAllLayers: vi.fn(async () => [
             { id: 1, name: "TopLayer", type: "signal" },
-            { id: 10, name: "BoardOutline", type: "boardoutline" }
+            { id: 11, name: "BoardOutline", type: "boardoutline" }
           ])
         }
       };
 
       const layer = await resolveBoardOutlineLayer(eda);
-      expect(layer).toEqual({ id: 10, name: "BoardOutline" });
+      expect(layer).toEqual({ id: 11, name: "BoardOutline" });
     });
 
-    it("falls back to default layer 10 if layers are absent", async () => {
+    it("falls back to SDK board-outline layer11 if layers are absent", async () => {
       const layer = await resolveBoardOutlineLayer({});
-      expect(layer).toEqual({ id: 10, name: "BoardOutline" });
+      expect(layer).toEqual({ id: 11, name: "BoardOutline" });
     });
   });
 
   describe("getBoardOutlineSummary", () => {
     it("computes bounds, closure, perimeter, and area for rectangular lines", async () => {
       const lines = [
-        { primitiveId: "l1", layer: 10, startX: 0, startY: 0, endX: 100, endY: 0 },
-        { primitiveId: "l2", layer: 10, startX: 100, startY: 0, endX: 100, endY: 50 },
-        { primitiveId: "l3", layer: 10, startX: 100, startY: 50, endX: 0, endY: 50 },
-        { primitiveId: "l4", layer: 10, startX: 0, startY: 50, endX: 0, endY: 0 }
+        { primitiveId: "l1", layer: 11, startX: 0, startY: 0, endX: 100, endY: 0 },
+        { primitiveId: "l2", layer: 11, startX: 100, startY: 0, endX: 100, endY: 50 },
+        { primitiveId: "l3", layer: 11, startX: 100, startY: 50, endX: 0, endY: 50 },
+        { primitiveId: "l4", layer: 11, startX: 0, startY: 50, endX: 0, endY: 0 }
       ];
 
       const api = () => ({
@@ -53,7 +53,7 @@ describe("PCB Board Outline Mutations & Inspection", () => {
           }))
         },
         pcb_Layer: {
-          getAllLayers: vi.fn(async () => [{ id: 10, name: "BoardOutline" }])
+          getAllLayers: vi.fn(async () => [{ id: 11, name: "BoardOutline" }])
         },
         pcb_PrimitiveLine: {
           getAll: vi.fn(async () => lines)
@@ -79,8 +79,8 @@ describe("PCB Board Outline Mutations & Inspection", () => {
 
     it("detects unclosed open path outlines", async () => {
       const lines = [
-        { primitiveId: "l1", layer: 10, startX: 0, startY: 0, endX: 100, endY: 0 },
-        { primitiveId: "l2", layer: 10, startX: 100, startY: 0, endX: 100, endY: 50 }
+        { primitiveId: "l1", layer: 11, startX: 0, startY: 0, endX: 100, endY: 0 },
+        { primitiveId: "l2", layer: 11, startX: 100, startY: 0, endX: 100, endY: 50 }
       ];
 
       const api = () => ({
@@ -150,6 +150,29 @@ describe("PCB Board Outline Mutations & Inspection", () => {
       });
     };
 
+    it("prepares a create-only rectangle in mm using native mil and SDK layer11", async () => {
+      const prepared = await prepareBoardOutlineMutation(mockPcbApi(), {
+        action: "create",
+        units: "mm",
+        x: 2.54,
+        y: 0,
+        width: 25.4,
+        height: 12.7
+      });
+      const op = extensionMutations.get(String(prepared.mutationId)).operation as any;
+      expect(op).toMatchObject({ createOnly: true, clearExisting: false, layerId: 11 });
+      expect(op.width).toBeCloseTo(1000);
+      expect(op.height).toBeCloseTo(500);
+      expect(op.x).toBeCloseTo(100);
+    });
+
+    it("refuses create-only when any existing outline is present", async () => {
+      const lines = [{ primitiveId: "existing", layer: 11, startX: 0, startY: 0, endX: 100, endY: 0 }];
+      await expect(
+        prepareBoardOutlineMutation(mockPcbApi(lines), { action: "create", width: 100, height: 100 })
+      ).rejects.toThrow(/already exists/i);
+    });
+
     it("prepares set_rectangle with valid dimensions and confirmation token", async () => {
       const api = mockPcbApi();
       const prepared = (await prepareBoardOutlineMutation(api, {
@@ -201,10 +224,10 @@ describe("PCB Board Outline Mutations & Inspection", () => {
 
     it("prepares clear action when outline exists", async () => {
       const existingLines = [
-        { primitiveId: "l1", layer: 10, startX: 0, startY: 0, endX: 50, endY: 0 },
-        { primitiveId: "l2", layer: 10, startX: 50, startY: 0, endX: 50, endY: 50 },
-        { primitiveId: "l3", layer: 10, startX: 50, startY: 50, endX: 0, endY: 50 },
-        { primitiveId: "l4", layer: 10, startX: 0, startY: 50, endX: 0, endY: 0 }
+        { primitiveId: "l1", layer: 11, startX: 0, startY: 0, endX: 50, endY: 0 },
+        { primitiveId: "l2", layer: 11, startX: 50, startY: 0, endX: 50, endY: 50 },
+        { primitiveId: "l3", layer: 11, startX: 50, startY: 50, endX: 0, endY: 50 },
+        { primitiveId: "l4", layer: 11, startX: 0, startY: 50, endX: 0, endY: 0 }
       ];
 
       const api = mockPcbApi(existingLines);
@@ -227,7 +250,7 @@ describe("PCB Board Outline Mutations & Inspection", () => {
     });
 
     it("prepares modify_segment for an existing segment", async () => {
-      const existingLines = [{ primitiveId: "l1", layer: 10, startX: 0, startY: 0, endX: 50, endY: 0 }];
+      const existingLines = [{ primitiveId: "l1", layer: 11, startX: 0, startY: 0, endX: 50, endY: 0 }];
 
       const api = mockPcbApi(existingLines);
       const prepared = (await prepareBoardOutlineMutation(api, {
@@ -246,80 +269,119 @@ describe("PCB Board Outline Mutations & Inspection", () => {
   });
 
   describe("executeBoardOutlineMutation & actionHandlers confirmation", () => {
-    it("executes set_rectangle, creates 4 lines and verifies readback", async () => {
-      let linesState: any[] = [];
-      const createMock = vi.fn(
-        async (_net: string, layer: any, startX: number, startY: number, endX: number, endY: number) => {
-          const newLine = {
-            primitiveId: `line_${linesState.length + 1}`,
-            layer,
-            startX,
-            startY,
-            endX,
-            endY
-          };
-          linesState.push(newLine);
-          return newLine;
-        }
-      );
-
-      const zoomMock = vi.fn(async () => true);
-
+    it("preserves an outline that appeared after a create-only preview", async () => {
+      const create = vi.fn(),
+        remove = vi.fn();
       const api = () => ({
-        dmt_SelectControl: {
-          getCurrentDocumentInfo: vi.fn(async () => ({
-            uuid: "pcb-doc-1",
-            documentType: 3
-          }))
-        },
-        pcb_Layer: {
-          getAllLayers: vi.fn(async () => [{ id: 10, name: "BoardOutline" }])
-        },
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "pcb", documentType: 3 }) },
         pcb_PrimitiveLine: {
-          getAll: vi.fn(async () => linesState),
-          create: createMock,
-          delete: vi.fn(async (ids: string[]) => {
-            linesState = linesState.filter((l) => !ids.includes(l.primitiveId));
-          })
-        },
-        pcb_Document: {
-          zoomToBoardOutline: zoomMock
+          getAll: async () => [{ primitiveId: "existing", layer: 11, startX: 0, startY: 0, endX: 100, endY: 0 }],
+          create,
+          delete: remove
         }
       });
-
+      await expect(
+        executeBoardOutlineMutation(api, {
+          action: "set_rectangle",
+          createOnly: true,
+          clearExisting: false,
+          width: 100,
+          height: 100
+        })
+      ).rejects.toThrow(/already exists|changed/i);
+      expect(create).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    });
+    it("creates one native closed polyline on layer11, never a copper line, and verifies its geometry", async () => {
+      const state: any[] = [];
+      const create = vi.fn(async (_net, layer, polygon, lineWidth) => {
+        const primitive = { primitiveId: "poly1", layer, polygon, lineWidth };
+        state.push(primitive);
+        return primitive;
+      });
+      const lineCreate = vi.fn(() => {
+        throw new Error("Board outline requires Polyline");
+      });
+      const createPolygon = vi.fn((source) => ({ getSource: () => source }));
+      const api = () => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "pcb", documentType: 3 }) },
+        pcb_MathPolygon: { createPolygon },
+        pcb_PrimitivePolyline: { create, getAll: async () => state },
+        pcb_PrimitiveLine: { create: lineCreate, getAll: async () => [] }
+      });
       const result = await executeBoardOutlineMutation(api, {
         action: "set_rectangle",
         x: 10,
         y: 20,
         width: 100,
         height: 80,
-        clearExisting: true
+        lineWidth: 6
       });
-
-      expect(result.executed).toBe(true);
-      expect(createMock).toHaveBeenCalledTimes(4);
-      expect(zoomMock).toHaveBeenCalled();
+      expect(lineCreate).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledExactlyOnceWith("", 11, expect.any(Object), 6, false);
+      expect(createPolygon).toHaveBeenCalledWith([10, 20, "L", 110, 20, 110, 100, 10, 100, 10, 20]);
       expect(result.readback).toMatchObject({
         segmentCount: 4,
         isClosed: true,
-        bounds: {
-          minX: 10,
-          minY: 20,
-          maxX: 110,
-          maxY: 100,
-          width: 100,
-          height: 80
-        },
+        bounds: { minX: 10, minY: 20, maxX: 110, maxY: 100, width: 100, height: 80 },
         verified: true
       });
     });
 
+    it("clears a polyline once with its own SDK API rather than the copper-line API", async () => {
+      let state: any[] = [
+        { primitiveId: "poly1", layer: 11, polygon: { getSource: () => [0, 0, "L", 100, 0, 100, 50, 0, 50, 0, 0] } }
+      ];
+      const remove = vi.fn(async () => {
+        state = [];
+        return true;
+      });
+      const lineRemove = vi.fn();
+      const api = () => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "pcb", documentType: 3 }) },
+        pcb_PrimitivePolyline: { getAll: async () => state, delete: remove },
+        pcb_PrimitiveLine: { getAll: async () => [], delete: lineRemove }
+      });
+      const before = await getBoardOutlineSummary(api);
+      expect(before.exists).toBe(true);
+      expect(before.isClosed).toBe(true);
+      await executeBoardOutlineMutation(api, { action: "clear" });
+      expect(remove).toHaveBeenCalledExactlyOnceWith(["poly1"]);
+      expect(lineRemove).not.toHaveBeenCalled();
+    });
+
+    it("does not erase an existing outline when native polygon construction fails", async () => {
+      const remove = vi.fn(),
+        create = vi.fn();
+      const api = () => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "pcb", documentType: 3 }) },
+        pcb_PrimitiveLine: {
+          getAll: async () => [{ primitiveId: "old", layer: 11, startX: 0, startY: 0, endX: 100, endY: 0 }],
+          delete: remove
+        },
+        pcb_MathPolygon: { createPolygon: () => undefined },
+        pcb_PrimitivePolyline: { create, getAll: async () => [] }
+      });
+      await expect(
+        executeBoardOutlineMutation(api, {
+          action: "set_rectangle",
+          x: 0,
+          y: 0,
+          width: 100,
+          height: 50,
+          clearExisting: true
+        })
+      ).rejects.toThrow(/rejected/);
+      expect(remove).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+    });
+
     it("clears board outline and verifies via confirmed_action integration", async () => {
       let linesState = [
-        { primitiveId: "l1", layer: 10, startX: 0, startY: 0, endX: 50, endY: 0 },
-        { primitiveId: "l2", layer: 10, startX: 50, startY: 0, endX: 50, endY: 50 },
-        { primitiveId: "l3", layer: 10, startX: 50, startY: 50, endX: 0, endY: 50 },
-        { primitiveId: "l4", layer: 10, startX: 0, startY: 50, endX: 0, endY: 0 }
+        { primitiveId: "l1", layer: 11, startX: 0, startY: 0, endX: 50, endY: 0 },
+        { primitiveId: "l2", layer: 11, startX: 50, startY: 0, endX: 50, endY: 50 },
+        { primitiveId: "l3", layer: 11, startX: 50, startY: 50, endX: 0, endY: 50 },
+        { primitiveId: "l4", layer: 11, startX: 0, startY: 50, endX: 0, endY: 0 }
       ];
 
       const api = () => ({
@@ -331,7 +393,7 @@ describe("PCB Board Outline Mutations & Inspection", () => {
           }))
         },
         pcb_Layer: {
-          getAllLayers: vi.fn(async () => [{ id: 10, name: "BoardOutline" }])
+          getAllLayers: vi.fn(async () => [{ id: 11, name: "BoardOutline" }])
         },
         pcb_PrimitiveLine: {
           getAll: vi.fn(async () => linesState),
