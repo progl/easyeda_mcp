@@ -1,4 +1,6 @@
 import { prepareExplicitUnroute, executeExplicitUnroute } from "./pcbExplicitUnroute.js";
+import { collectRoutingNetContext } from "./routingNetContext.js";
+import { canonicalJson } from "../../../src/mutation/contracts.js";
 import { apiError, isRecord, optionalCall, toArray } from "../helpers.js";
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
@@ -205,29 +207,55 @@ export async function preparePcbRoutingMutation(
 
   const action = String(params.action ?? "autoroute").toLowerCase();
   const nativeOptions = routingOptions(params);
-  const nets = nativeOptions.RoutingNets;
+  let nets = nativeOptions.RoutingNets;
   const ignoreNets = nativeOptions.ignoreNets;
   const keepExistingRoutes = nativeOptions.existingPrimitiveMode === "keep";
 
   const currentSummary = await fetchRoutingSummary(api);
 
   if (action === "autoroute") {
-    const targetDesc =
-      nets && nets.length > 0 ? `${nets.length} specified nets (${nets.join(", ")})` : "all unrouted nets";
+    const context = !nets.length && ignoreNets.length ? await collectRoutingNetContext(api, currentTarget) : undefined;
+    if (context) nets = context.allNetNames;
+    const effectiveNets = context ? nets.filter((name) => !ignoreNets.includes(name)) : nets;
+    const routingContext = context
+      ? {
+          mode: "materialized_default",
+          metadataNetNames: nets,
+          routingNetNames: effectiveNets,
+          nativeInventoryCounts: context.counts,
+          verificationScope: context.scope,
+          geometryVerified: false
+        }
+      : nets.length && ignoreNets.length
+        ? {
+            mode: "caller_explicit_selection",
+            metadataCompleteness: "not_verified",
+            warnings: [
+              "Explicit RoutingNets is unchanged. Unselected/ignored nets may be absent from native exporter metadata even when their copper is kept; use the complete native net context when excluding routing nets."
+            ]
+          }
+        : undefined;
+    const targetDesc = context
+      ? `${effectiveNets.length} effective nets with ${nets.length} native metadata nets`
+      : nets.length > 0
+        ? `${nets.length} specified nets (${nets.join(", ")})`
+        : "all unrouted nets";
     const impact = `Executes native PCB auto-routing for ${targetDesc} (preserving existing routes: ${keepExistingRoutes}). Native routing can run up to 900 seconds; a bridge/lifecycle deadline does not cancel it. Query the mutationId after unknown; never replay automatically. Completion and native DRC require separate evidence.`;
 
     const preview = {
       impact,
       scope: `document:${currentTarget.documentId ?? "active_pcb"}`,
       before: {
-        totalNets: currentSummary.totalNets,
+        totalNets: context?.allNetNames.length ?? currentSummary.totalNets,
         routedNets: currentSummary.routedNets,
         unroutedNets: currentSummary.unroutedNets,
         completionPercent: currentSummary.completionPercent
       },
       requestedAfter: {
         action: "autoroute",
-        targetNets: nets.length ? nets : "all",
+        targetNets: context ? effectiveNets : nets.length ? nets : "all",
+        ...(context ? { sdkRoutingNets: nets } : {}),
+        ...(routingContext ? { routingContext } : {}),
         keepExistingRoutes,
         completionGuaranteed: false,
         nativeTask: NATIVE_ROUTE_CONTRACT
@@ -244,9 +272,13 @@ export async function preparePcbRoutingMutation(
         nets,
         ignoreNets,
         keepExistingRoutes,
-        nativeTaskContract: NATIVE_ROUTE_CONTRACT
+        nativeTaskContract: NATIVE_ROUTE_CONTRACT,
+        ...(context
+          ? { routingContext: { mode: "materialized_default", beforeReference: "record.before.routingNetContext" } }
+          : {})
       },
-      before: preview.before,
+      before: context ? { ...preview.before, routingNetContext: context } : preview.before,
+      ...(context ? { previewBefore: preview.before } : {}),
       requestedAfter: preview.requestedAfter,
       changedKeys: preview.changedKeys,
       scope: preview.scope,
@@ -270,7 +302,7 @@ export async function preparePcbRoutingMutation(
 export async function executePcbRoutingMutation(
   api: () => EasyEdaApi,
   op: Record<string, any>,
-  _expectedBefore?: unknown
+  expectedBefore?: unknown
 ): Promise<{ executed: boolean; readback: Record<string, unknown> }> {
   if (op.action === "unroute") return executeExplicitUnroute(api, op);
   const eda = api();
@@ -282,7 +314,42 @@ export async function executePcbRoutingMutation(
         "Public pcb_Document.autoRouting is unavailable; undocumented autoRoute aliases and unsupported native job stubs are not invoked."
       );
     const props = routingOptions(op);
-    if (op.target)
+    if (!props.RoutingNets.length && props.ignoreNets.length)
+      throw apiError(
+        "prepared_routing_context_required",
+        "Excluded default routing requires prepared complete native metadata; no implicit empty RoutingNets dispatch."
+      );
+    const materializedContext = op.routingContext?.mode === "materialized_default";
+    if (materializedContext) {
+      const before = (expectedBefore as any)?.routingNetContext;
+      if (
+        before?.schema !== "native_routing_net_context_v1" ||
+        before.scope !== "net_membership_only" ||
+        typeof before.fingerprint !== "string" ||
+        !Array.isArray(before.allNetNames) ||
+        canonicalJson(props.RoutingNets) !== canonicalJson(before.allNetNames)
+      )
+        throw apiError(
+          "prepared_routing_context_required",
+          "Complete prepared native routing context required before dispatch."
+        );
+      const current = await collectRoutingNetContext(api, op.target);
+      if (canonicalJson(current) !== canonicalJson(before))
+        throw apiError(
+          "stale_routing_context",
+          "Native net inventory changed after preparation; routing was not dispatched. Prepare and review again."
+        );
+      if (typeof op.mutationId === "string") {
+        const state = extensionMutations.getExecutionState();
+        if (state.activeMutationId !== op.mutationId || state.activeStatus !== "running")
+          throw apiError(
+            "execution_budget_expired",
+            "Routing lifecycle expired during native context observation; no routing dispatched."
+          );
+      }
+    }
+    // The bounded context read already finishes with an exact target check.
+    if (op.target && !materializedContext)
       assertDocumentTargetMatch(
         op.target,
         extractDocumentIdentity(await eda.dmt_SelectControl?.getCurrentDocumentInfo?.())

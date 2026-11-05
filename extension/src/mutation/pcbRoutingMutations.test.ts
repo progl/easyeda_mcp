@@ -431,3 +431,124 @@ it("settles native success:false as a failed mutation with observable non-retrya
   });
   expect(autoRouting).toHaveBeenCalledTimes(1);
 });
+
+describe("default autoroute exclusions retain complete net metadata", () => {
+  beforeEach(() => extensionMutations.invalidateAll());
+  function nativeFixture() {
+    const names = ["GND", "SIGNAL"];
+    const pads = [
+      { primitiveId: "p1", net: "PAD_ONLY" },
+      { primitiveId: "p2", net: "GND2" },
+      { primitiveId: "p3", net: "SIGNAL" }
+    ];
+    const tracks = [{ primitiveId: "line1", net: "TRACK_ONLY" }];
+    const vias = [{ primitiveId: "via1", net: "VIA_ONLY" }];
+    const eda: any = {
+      dmt_SelectControl: {
+        getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "project", documentType: 3 })
+      },
+      pcb_Net: { getAllNetsName: async () => names },
+      pcb_PrimitiveComponent: {
+        getAll: async () => [{ primitiveId: "c1" }],
+        getAllPinsByPrimitiveId: async () => pads
+      },
+      pcb_PrimitiveLine: { getAll: async () => tracks },
+      pcb_PrimitiveVia: { getAll: async () => vias },
+      pcb_Document: { autoRouting: vi.fn(async () => ({ success: true })) }
+    };
+    return { api: () => eda, eda, names, pads, tracks, vias };
+  }
+  const excluded = { action: "autoroute", ignoreNets: ["GND", "GND2"], keepExistingRoutes: true };
+  const allNames = ["GND", "GND2", "PAD_ONLY", "SIGNAL", "TRACK_ONLY", "VIA_ONLY"];
+  it("materializes the native union while previewing the effective routing selection separately", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const record: any = extensionMutations.get(p.mutationId);
+    expect(record.operation.nets).toEqual(allNames);
+    expect(record.before.routingNetContext).toMatchObject({
+      scope: "net_membership_only",
+      allNetNames: allNames,
+      counts: { components: 1, pads: 3, tracks: 1, vias: 1 }
+    });
+    expect(p.preview.requestedAfter).toMatchObject({
+      targetNets: ["PAD_ONLY", "SIGNAL", "TRACK_ONLY", "VIA_ONLY"],
+      sdkRoutingNets: allNames,
+      routingContext: { mode: "materialized_default", geometryVerified: false }
+    });
+    await executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before);
+    expect(f.eda.pcb_Document.autoRouting).toHaveBeenCalledExactlyOnceWith({
+      RoutingNets: allNames,
+      ignoreNets: ["GND", "GND2"],
+      existingPrimitiveMode: "keep"
+    });
+  });
+  it.each(["names", "pads", "tracks", "vias"] as const)(
+    "refuses changed %s membership before the one native write, even when counts are unchanged",
+    async (kind) => {
+      const f = nativeFixture();
+      const p: any = await preparePcbRoutingMutation(f.api, excluded);
+      const record: any = extensionMutations.get(p.mutationId);
+      if (kind === "names") f.names[0] = "RENAMED";
+      else f[kind][0].net = "RENAMED";
+      await expect(
+        executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before)
+      ).rejects.toMatchObject({ code: "stale_routing_context" });
+      expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+    }
+  );
+  it("refuses incomplete native component-pad enumeration before preparing an unsafe fallback", async () => {
+    const f = nativeFixture();
+    delete f.eda.pcb_PrimitiveComponent.getAllPinsByPrimitiveId;
+    await expect(preparePcbRoutingMutation(f.api, excluded)).rejects.toMatchObject({
+      code: "routing_context_unavailable"
+    });
+    expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+  });
+  it("does not reinterpret an explicit subset and warns that native metadata completeness is unverified", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, { ...excluded, nets: ["SIGNAL"] });
+    expect(extensionMutations.get(p.mutationId).operation.nets).toEqual(["SIGNAL"]);
+    expect(p.preview.requestedAfter.routingContext).toMatchObject({
+      mode: "caller_explicit_selection",
+      metadataCompleteness: "not_verified"
+    });
+    expect(p.preview.requestedAfter.routingContext.warnings.join(" ")).toMatch(/metadata/i);
+  });
+  it("refuses an excluded default without its prepared membership proof", async () => {
+    const f = nativeFixture();
+    await expect(executePcbRoutingMutation(f.api, excluded)).rejects.toMatchObject({
+      code: "prepared_routing_context_required"
+    });
+    expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+  });
+  it("never dispatches after a timed-out native context read eventually resolves", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const record: any = extensionMutations.get(p.mutationId);
+    vi.useFakeTimers();
+    try {
+      let finish!: (value: any) => void;
+      f.eda.pcb_PrimitiveComponent.getAll = () => new Promise((resolve) => (finish = resolve));
+      const execute = executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before);
+      const check = expect(execute).rejects.toMatchObject({ code: "routing_context_unavailable" });
+      await vi.advanceTimersByTimeAsync(10001);
+      await check;
+      finish([{ primitiveId: "c1" }]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("keeps a rejected native call unknown and never replays the materialized default", async () => {
+    const f = nativeFixture();
+    f.eda.pcb_Document.autoRouting.mockRejectedValue(new Error("RPC Call autoRouting Timed Out"));
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const handlers = createActionHandlers(f.api, new DrcRules(f.api));
+    const request = { action: "mutation", params: { mutationId: p.mutationId }, confirmation: p.confirmation };
+    const result = await handlers.confirmedAction(request);
+    expect(result).toMatchObject({ status: "unknown" });
+    await expect(handlers.confirmedAction(request)).rejects.toThrow();
+    expect(f.eda.pcb_Document.autoRouting).toHaveBeenCalledTimes(1);
+  });
+});

@@ -729,6 +729,12 @@ Returns `mutationId`, exact confirmation token `CONFIRM pcb:<action> <mutationId
 - **`target`** (`object`, _optional_): Expected document target specification to assert against active canvas.
 - **`timeoutMs`** (`number`, _optional_, default: `30000`): RPC timeout in ms.
 
+**Default routing with exclusions:** when `nets` is omitted or empty and `ignoreNets` is nonempty, preparation now materializes an explicit complete net-name union from native net enumeration, component pads, tracks, and vias. Native exporters can derive their metadata set from `RoutingNets`; leaving that list implicit with exclusions can omit metadata for kept copper. The stored operation uses every observed net as SDK `RoutingNets`, while exclusions remain in `ignoreNets`. The preview separates effective `targetNets` from `sdkRoutingNets` and declares `verificationScope: "net_membership_only"`, `geometryVerified: false`.
+
+The complete canonical native membership fingerprint stays in `record.before.routingNetContext`, with a compact preview referencing `record.before`. Before the single routing dispatch, an independent read must match native names and component/pad/track/via identities and net memberships exactly. Missing APIs, malformed inventory, target drift, a read exceeding ten seconds, or stale membership prevent dispatch; an unknown result is never replayed. This comparison does not cover geometry, clearance rules, copper areas, or manufacturing correctness.
+
+Explicit nonempty `nets` lists are never expanded automatically. With nonempty `ignoreNets`, their preview warns that metadata completeness is unverified: supplying only the desired signal nets is different from supplying all context nets and excluding routing on the others. Empty exclusions retain the previous behavior. SDK promise settlement or a bridge timeout still does not prove the native GUI job has finished.
+
 ---
 
 ### `easyeda_reconcile_explicit_unroute`
