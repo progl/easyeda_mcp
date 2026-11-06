@@ -138,8 +138,8 @@ Prepares a typed schematic component mutation (`create`, `move`, `update`, `dele
 - **`dx`**, **`dy`** (`number`, _optional_): Relative coordinate offsets for `move`.
 - **`properties`** (`object`, _optional_): Key-value properties map to update.
 - **`designator`** (`string`, _optional_): Designator to assign or update.
-- **`value`** (`string`, _optional_): Component value.
-- **`footprint`** (`string`, _optional_): Footprint package name.
+- **`value`** (`string`, _optional_): Update alias for native component `name`, verified by independent readback.
+- **`footprint`** (`string`, _optional_): Legacy field; generic updates reject footprint names and library references.
 - **`rotation`** (`number`, _optional_): Rotation in degrees (`0`, `90`, `180`, `270`).
 - **`mirror`** (`boolean`, _optional_): Mirror state.
 - **`subPartName`** (`string`, _optional_): Sub-part name for multi-part components.
@@ -160,6 +160,14 @@ rejects changed geometry, preserves correct connections, and verifies readback.
 Existing conflicting connections require explicit repair. A partial failure must
 be inspected before retrying; the batch is not atomic and is never replayed.
 Independent net labels require a confirmed v4 runtime; use named wires on v3.
+
+#### Проверяемые обновления свойств
+
+Generic `action:"update"` принимает только документированные поля public [SCH_PrimitiveComponent.modify](https://prodocs.easyeda.com/en/api/reference/pro-api.sch_primitivecomponent.modify.html): позицию/поворот, mirror, designator/name, BOM/PCB flags, uniqueId, производителя/поставщика, subPartName и скалярные `otherProperty`. `value` — совместимый входной псевдоним нативного `name`; одновременно задавать оба нельзя.
+
+Изменение `footprint` (строки или ссылки библиотеки), device и неизвестных свойств отклоняется **до записи**, включая выполнение старых prepared records. Название корпуса не считается доказательством смены библиотечной ссылки; структурная ссылка в снимке сохраняется объектом.
+
+Успешный SDK response не означает `applied`: после записи независимо перечитываются все запрошенные поля через native getters/реальные поля. Для `otherProperty` проверяется каждое запрошенное скалярное значение; `false`, `0` и пустые строки не пропускаются. Отсутствующее поле не доказывает сброс в `null`. Результат содержит наблюдённые `properties` и `verifiedKeys`. Игнорирование хотя бы одного поля, ошибка записи или неподтверждённый readback дают `unknown`; повторная запись не выполняется автоматически. Сохранение документа остаётся отдельным действием.
 
 ### `easyeda_prepare_schematic_wire`
 

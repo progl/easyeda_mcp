@@ -25,7 +25,7 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
     {
       title: "Prepare Schematic Component Mutation",
       description:
-        "Prepares a create, move, update, or delete operation on a schematic component with full preview, ID/designator resolution, and exact confirmation phrase. Does not modify the schematic until confirmed via easyeda_confirmed_action.",
+        "Prepares a create, move, update, or delete operation on a schematic component with full preview, ID/designator resolution, and exact confirmation phrase. Generic updates accept only documented native scalar fields/otherProperty; value aliases native name. Footprint/device-reference updates are rejected before dispatch. Every requested update field must match fresh independent readback; ignored or uncertain writes remain unknown. Does not modify the schematic until confirmed via easyeda_confirmed_action.",
       inputSchema: {
         action: z.enum(["create", "move", "update", "delete"]).describe("Component mutation action to perform"),
         component: z
@@ -44,7 +44,9 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
         properties: z
           .record(z.string(), z.unknown())
           .optional()
-          .describe("Key-value properties to update (designator, value, footprint, rotation, mirror, etc.)"),
+          .describe(
+            "Documented native update fields: designator, name/value, x/y, rotation, mirror, addIntoBom/addIntoPcb, uniqueId, manufacturer/manufacturerId, supplier/supplierId, subPartName, scalar otherProperty. Footprint/device references are unsupported."
+          ),
         designator: z.string().optional().describe("Designator to assign or update (e.g. 'R10')"),
         uniqueId: z
           .string()
@@ -52,8 +54,14 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
           .min(1)
           .optional()
           .describe("Explicit stable uniqueId assigned and independently verified after create"),
-        value: z.string().optional().describe("Component value (e.g. '10k', '100nF')"),
-        footprint: z.string().optional().describe("Footprint package name (e.g. '0603', 'SOIC-8')"),
+        value: z
+          .string()
+          .optional()
+          .describe("Update alias for native component name (e.g. '10k', '100nF'), independently verified"),
+        footprint: z
+          .string()
+          .optional()
+          .describe("Deprecated: generic footprint updates are rejected; use a supported replacement workflow"),
         rotation: z.number().optional().describe("Rotation angle in degrees (0, 90, 180, 270)"),
         mirror: z.boolean().optional().describe("Mirror state"),
         subPartName: z.string().optional().describe("Sub-part name for multi-part components"),

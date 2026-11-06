@@ -466,3 +466,222 @@ describe("Schematic Component Mutations", () => {
     expect(create).not.toHaveBeenCalled();
   });
 });
+
+describe("generic schematic update native contract", () => {
+  beforeEach(() => extensionMutations.invalidateAll());
+  function fixture(persist = false) {
+    const state: Record<string, any> = {
+      primitiveId: "part-a",
+      designator: "R1",
+      name: "old",
+      x: 1,
+      y: 2,
+      rotation: 0,
+      mirror: false,
+      addIntoBom: true,
+      addIntoPcb: true,
+      manufacturer: "old vendor",
+      otherProperty: { Description: "old", enabled: true },
+      footprint: { uuid: "old-footprint", libraryUuid: "personal", name: "old package" }
+    };
+    const modify = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      if (persist) Object.assign(state, patch);
+      // A completed SDK call/result is deliberately not persistence evidence.
+      return { ...state, ...patch };
+    });
+    const api = () => ({
+      dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "sheet-a", documentType: 1 }) },
+      sch_PrimitiveComponent: { getAll: async () => [{ ...state }], modify }
+    });
+    return { state, modify, api, handlers: createActionHandlers(api, new DrcRules(api)) };
+  }
+  async function confirm(f: ReturnType<typeof fixture>, properties: Record<string, unknown>) {
+    const p = await prepareSchematicComponentMutation(f.api, { action: "update", component: "R1", properties });
+    return f.handlers.confirmedAction({
+      action: "mutation",
+      params: { mutationId: p.mutationId },
+      confirmation: p.confirmation
+    });
+  }
+
+  it.each(["package-a", { uuid: "new-footprint", libraryUuid: "personal", name: "package-a" }])(
+    "rejects unsupported footprint changes before dispatch (%j)",
+    async (footprint) => {
+      const f = fixture();
+      await expect(
+        prepareSchematicComponentMutation(f.api, {
+          action: "update",
+          component: "R1",
+          properties: { footprint }
+        })
+      ).rejects.toMatchObject({ code: "unsupported_property" });
+      expect(f.modify).not.toHaveBeenCalled();
+    }
+  );
+  it("rejects the legacy top-level footprint alias without stringifying it", async () => {
+    const f = fixture();
+    await expect(
+      prepareSchematicComponentMutation(f.api, {
+        action: "update",
+        component: "R1",
+        footprint: { uuid: "new-footprint" }
+      })
+    ).rejects.toMatchObject({ code: "unsupported_property" });
+  });
+  it("rejects unsupported properties instead of silently forwarding them", async () => {
+    const f = fixture();
+    await expect(
+      prepareSchematicComponentMutation(f.api, {
+        action: "update",
+        component: "R1",
+        properties: { madeUpField: true }
+      })
+    ).rejects.toMatchObject({ code: "unsupported_property" });
+  });
+  it("blocks legacy prepared footprint operations at execution before any SDK write", async () => {
+    const f = fixture();
+    await expect(
+      executeSchematicComponentMutation(
+        {
+          operation: {
+            action: "updateComponent",
+            primitiveId: "part-a",
+            properties: { footprint: { uuid: "new" } }
+          }
+        } as any,
+        f.api
+      )
+    ).rejects.toMatchObject({ code: "unsupported_property" });
+    expect(f.modify).not.toHaveBeenCalled();
+  });
+  it.each([
+    { name: "new" },
+    { rotation: 90 },
+    { mirror: true },
+    { addIntoBom: false },
+    { addIntoPcb: false },
+    { manufacturer: "new vendor" },
+    { otherProperty: { Description: "new" } }
+  ])("never reports ignored requested keys as applied (%j)", async (properties) => {
+    const f = fixture();
+    const result: any = await confirm(f, properties);
+    expect(result.status).toBe("unknown");
+    expect(result.error).toMatch(/readback|mismatch/i);
+    expect(f.modify).toHaveBeenCalledTimes(1);
+  });
+  it("requires every requested key even when the designator persisted", async () => {
+    const f = fixture();
+    f.modify.mockImplementation(async (_id, patch) => {
+      f.state.designator = patch.designator;
+      return { ...f.state, ...patch };
+    });
+    const result: any = await confirm(f, { designator: "R2", name: "not persisted" });
+    expect(result.status).toBe("unknown");
+    expect(result.error).toMatch(/name/);
+  });
+  it("verifies false and zero values and returns fresh observed properties", async () => {
+    const f = fixture(true);
+    const properties = {
+      name: "new",
+      mirror: false,
+      rotation: 0,
+      addIntoBom: false,
+      otherProperty: { enabled: false, count: 0, Description: "" }
+    };
+    const result: any = await confirm(f, properties);
+    expect(result.status).toBe("applied");
+    expect(result.after.properties).toEqual(properties);
+    expect(result.after.verifiedKeys.slice().sort()).toEqual(Object.keys(properties).sort());
+  });
+  it("maps the documented value alias to native name and verifies the independent name", async () => {
+    const f = fixture(true);
+    const p = await prepareSchematicComponentMutation(f.api, { action: "update", component: "R1", value: "22k" });
+    const result: any = await f.handlers.confirmedAction({
+      action: "mutation",
+      params: { mutationId: p.mutationId },
+      confirmation: p.confirmation
+    });
+    expect(f.modify).toHaveBeenCalledExactlyOnceWith("part-a", { name: "22k" });
+    expect(result.status).toBe("applied");
+    expect(result.after.properties.name).toBe("22k");
+  });
+  it("preserves structured footprint references in snapshots instead of [object Object]", async () => {
+    const f = fixture();
+    const c = await findComponentInSchematic(f.api, "R1");
+    expect(c.footprint).toEqual(f.state.footprint);
+  });
+});
+
+it("uses independent native getters rather than stale facade fields for an update receipt", async () => {
+  extensionMutations.invalidateAll();
+  const state = { designator: "R1", name: "old" };
+  const eda = {
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "getter-sheet", documentType: 1 }) },
+    sch_PrimitiveComponent: {
+      getAll: async () => [
+        {
+          primitiveId: "getter-part",
+          designator: "stale",
+          name: "stale",
+          x: 1,
+          y: 2,
+          getState_Designator: () => state.designator,
+          getState_Name: () => state.name
+        }
+      ],
+      modify: async (_id: string, patch: any) => {
+        Object.assign(state, patch);
+      }
+    }
+  };
+  const api = () => eda;
+  const p = await prepareSchematicComponentMutation(api, {
+    action: "update",
+    component: "getter-part",
+    properties: { designator: "R2", name: "new" }
+  });
+  const r: any = await createActionHandlers(api, new DrcRules(api)).confirmedAction({
+    action: "mutation",
+    params: { mutationId: p.mutationId },
+    confirmation: p.confirmation
+  });
+  expect(r.status).toBe("applied");
+  expect(r.after.designator).toBe("R2");
+  expect(r.after.properties).toEqual({ designator: "R2", name: "new" });
+});
+
+it("rejects an empty legacy generic update before SDK dispatch", async () => {
+  const modify = vi.fn();
+  await expect(
+    executeSchematicComponentMutation(
+      { operation: { action: "updateComponent", primitiveId: "legacy-part", properties: {} } } as any,
+      () => ({ sch_PrimitiveComponent: { modify } })
+    )
+  ).rejects.toMatchObject({ code: "invalid_params" });
+  expect(modify).not.toHaveBeenCalled();
+});
+
+it("does not treat an absent readback field as proof of a requested null reset", async () => {
+  extensionMutations.invalidateAll();
+  const modify = vi.fn(async () => ({ manufacturer: null }));
+  const api = () => ({
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "reset-sheet", documentType: 1 }) },
+    sch_PrimitiveComponent: {
+      modify,
+      getAll: async () => [{ primitiveId: "reset-part", designator: "R1", x: 1, y: 2 }]
+    }
+  });
+  const p = await prepareSchematicComponentMutation(api, {
+    action: "update",
+    component: "R1",
+    properties: { manufacturer: null }
+  });
+  const result: any = await createActionHandlers(api, new DrcRules(api)).confirmedAction({
+    action: "mutation",
+    params: { mutationId: p.mutationId },
+    confirmation: p.confirmation
+  });
+  expect(result.status).toBe("unknown");
+  expect(result.error).toMatch(/manufacturer.*unavailable/);
+  expect(modify).toHaveBeenCalledTimes(1);
+});

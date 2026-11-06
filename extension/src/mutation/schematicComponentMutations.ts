@@ -14,6 +14,69 @@ import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.
 import { extensionMutations } from "./mutationManager.js";
 import type { EasyEdaApi } from "../types.js";
 import type { MutationRecord } from "../../../src/mutation/contracts.js";
+import { canonicalJson } from "../../../src/mutation/contracts.js";
+
+// Only fields documented by the public SCH_PrimitiveComponent.modify contract.
+// In particular a footprint library reference is not a supported generic setter.
+const NUMBER_PROPERTIES = new Set(["x", "y", "rotation"]);
+const BOOLEAN_PROPERTIES = new Set(["mirror", "addIntoBom", "addIntoPcb"]);
+const STRING_PROPERTIES = new Set([
+  "designator",
+  "name",
+  "uniqueId",
+  "manufacturer",
+  "manufacturerId",
+  "supplier",
+  "supplierId"
+]);
+
+function nativeProperty(raw: Record<string, any>, key: string): unknown {
+  const getter = raw[`getState_${key[0].toUpperCase()}${key.slice(1)}`];
+  return typeof getter === "function" ? getter.call(raw) : raw[key];
+}
+
+function validatedUpdateProperties(input: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(input) || Array.isArray(input) || !Object.keys(input).length)
+    throw apiError("invalid_params", "No properties provided to update.");
+  const properties = { ...input };
+  if (Object.prototype.hasOwnProperty.call(properties, "value")) {
+    if (typeof properties.value !== "string" || Object.prototype.hasOwnProperty.call(properties, "name"))
+      throw apiError("invalid_params", "value must be a string alias for native name; do not also provide name.");
+    properties.name = properties.value;
+    delete properties.value;
+  }
+  for (const [key, value] of Object.entries(properties)) {
+    if (NUMBER_PROPERTIES.has(key)) {
+      if (typeof value !== "number" || !Number.isFinite(value))
+        throw apiError("invalid_params", `${key} must be a finite number.`);
+    } else if (BOOLEAN_PROPERTIES.has(key)) {
+      if (typeof value !== "boolean") throw apiError("invalid_params", `${key} must be a boolean.`);
+    } else if (STRING_PROPERTIES.has(key)) {
+      if (typeof value !== "string" && value !== null)
+        throw apiError("invalid_params", `${key} must be a string or null.`);
+    } else if (key === "subPartName") {
+      if (typeof value !== "string") throw apiError("invalid_params", "subPartName must be a string.");
+    } else if (key === "otherProperty") {
+      if (
+        !isRecord(value) ||
+        Array.isArray(value) ||
+        !Object.keys(value).length ||
+        Object.values(value).some(
+          (v) => !["string", "boolean"].includes(typeof v) && !(typeof v === "number" && Number.isFinite(v))
+        )
+      )
+        throw apiError("invalid_params", "otherProperty requires nonempty finite scalar properties.");
+    } else {
+      throw apiError(
+        "unsupported_property",
+        `Generic schematic update does not support '${key}'. Footprint/device references require a separately supported replacement workflow.`
+      );
+    }
+  }
+  // Reject unsafe keys, non-plain objects and non-JSON values before any write,
+  // including execution of a record prepared by an older extension.
+  return JSON.parse(canonicalJson(properties));
+}
 
 // Cached schematic component UUIDs may be project-local 16-character IDs.
 // Public catalog placement requires the 32-character device AND library identifiers.
@@ -35,7 +98,7 @@ export type ResolvedComponent = {
   primitiveId: string;
   designator: string;
   value?: string;
-  footprint?: string;
+  footprint?: string | Record<string, unknown>;
   x: number;
   y: number;
   rotation?: number;
@@ -53,16 +116,26 @@ export async function findComponentInSchematic(api: () => EasyEdaApi, identifier
 
   for (const raw of rawComponents) {
     if (!isRecord(raw)) continue;
-    const primitiveId = String(raw.primitiveId ?? raw.id ?? raw.uuid ?? "").trim();
-    const designator = String(raw.designator ?? raw.name ?? raw.displayName ?? raw.prefix ?? "").trim();
+    const primitiveId = String(nativeProperty(raw, "primitiveId") ?? raw.id ?? raw.uuid ?? "").trim();
+    const designator = String(
+      nativeProperty(raw, "designator") ?? raw.name ?? raw.displayName ?? raw.prefix ?? ""
+    ).trim();
 
     if (primitiveId === trimmed || designator.toUpperCase() === upper) {
-      const x = numeric(raw.x) ?? 0;
-      const y = numeric(raw.y) ?? 0;
-      const value = (raw.value ?? raw.comment ?? raw.title) ? String(raw.value ?? raw.comment ?? raw.title) : undefined;
-      const footprint = (raw.footprint ?? raw.package) ? String(raw.footprint ?? raw.package) : undefined;
-      const rotation = numeric(raw.rotation);
-      const mirror = typeof raw.mirror === "boolean" ? raw.mirror : undefined;
+      const x = numeric(nativeProperty(raw, "x")) ?? 0;
+      const y = numeric(nativeProperty(raw, "y")) ?? 0;
+      const rawValue = raw.value ?? raw.comment ?? raw.title ?? nativeProperty(raw, "name");
+      const value = typeof rawValue === "string" || typeof rawValue === "number" ? String(rawValue) : undefined;
+      const rawFootprint = nativeProperty(raw, "footprint") ?? raw.package;
+      const footprint =
+        typeof rawFootprint === "string"
+          ? rawFootprint
+          : isRecord(rawFootprint)
+            ? JSON.parse(canonicalJson(rawFootprint))
+            : undefined;
+      const rotation = numeric(nativeProperty(raw, "rotation"));
+      const rawMirror = nativeProperty(raw, "mirror");
+      const mirror = typeof rawMirror === "boolean" ? rawMirror : undefined;
 
       return {
         primitiveId,
@@ -303,7 +376,7 @@ export async function prepareSchematicComponentMutation(
 
     if (params.designator !== undefined) properties.designator = String(params.designator).trim();
     if (params.value !== undefined) properties.value = String(params.value).trim();
-    if (params.footprint !== undefined) properties.footprint = String(params.footprint).trim();
+    if (params.footprint !== undefined) properties.footprint = params.footprint;
     if (isNumber(params.rotation)) properties.rotation = Number(params.rotation);
     if (typeof params.mirror === "boolean") properties.mirror = params.mirror;
 
@@ -311,12 +384,13 @@ export async function prepareSchematicComponentMutation(
     if (changedKeys.length === 0) {
       throw apiError("invalid_params", "No properties provided to update.");
     }
+    const nativeProperties = validatedUpdateProperties(properties);
 
     const operation = {
       action: "updateComponent",
       primitiveId: comp.primitiveId,
       designator: comp.designator,
-      properties
+      properties: nativeProperties
     };
 
     const before: Record<string, unknown> = {
@@ -594,27 +668,48 @@ export async function executeSchematicComponentMutation(
   }
 
   if (op.action === "updateComponent") {
+    const properties = validatedUpdateProperties(op.properties);
     ensureApi("sch_PrimitiveComponent", "modify", eda);
-    await eda.sch_PrimitiveComponent.modify(op.primitiveId, op.properties);
-
-    // Readback verification
-    const readback = await findComponentInSchematic(api, op.primitiveId);
-    if (op.properties.designator && readback.designator !== op.properties.designator) {
+    try {
+      await eda.sch_PrimitiveComponent.modify(op.primitiveId, properties);
+      // The SDK return value is not persistence evidence. Check every requested
+      // field through a fresh independent getter, including falsy scalar values.
+      const readback = await findComponentInSchematic(api, op.primitiveId);
+      const observed: Record<string, unknown> = {};
+      for (const [key, expected] of Object.entries(properties)) {
+        const getter = readback.raw[`getState_${key[0].toUpperCase()}${key.slice(1)}`];
+        if (typeof getter !== "function" && !Object.prototype.hasOwnProperty.call(readback.raw, key))
+          throw new Error(`${key} readback unavailable.`);
+        const actual = nativeProperty(readback.raw, key);
+        if (key === "otherProperty") {
+          if (!isRecord(actual) || Array.isArray(actual)) throw new Error(`${key} readback unavailable.`);
+          const values: Record<string, unknown> = {};
+          for (const [name, value] of Object.entries(expected as Record<string, unknown>)) {
+            if (actual[name] !== value) throw new Error(`${key}.${name} readback mismatch.`);
+            values[name] = actual[name];
+          }
+          observed[key] = values;
+        } else {
+          if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error(`${key} readback mismatch.`);
+          observed[key] = actual === undefined ? null : actual;
+        }
+      }
+      return {
+        executed: true,
+        readback: {
+          primitiveId: readback.primitiveId,
+          designator: readback.designator,
+          properties: observed,
+          verifiedKeys: Object.keys(properties),
+          verified: true
+        }
+      };
+    } catch (error) {
       throw apiError(
-        "readback_verification_failed",
-        `Designator update mismatch: expected '${op.properties.designator}', got '${readback.designator}'.`
+        "write_readback_unknown",
+        `Generic component update could not be independently confirmed; do not retry. ${String(error)}`
       );
     }
-
-    return {
-      executed: true,
-      readback: {
-        primitiveId: readback.primitiveId,
-        designator: readback.designator,
-        properties: op.properties,
-        verified: true
-      }
-    };
   }
 
   if (op.action === "deleteComponent") {
