@@ -379,6 +379,9 @@ export async function prepareSchematicComponentMutation(
     if (params.footprint !== undefined) properties.footprint = params.footprint;
     if (isNumber(params.rotation)) properties.rotation = Number(params.rotation);
     if (typeof params.mirror === "boolean") properties.mirror = params.mirror;
+    for (const key of ["addIntoBom", "addIntoPcb", "subPartName", "uniqueId"] as const) {
+      if (params[key] !== undefined) properties[key] = params[key];
+    }
 
     const changedKeys = Object.keys(properties);
     if (changedKeys.length === 0) {
@@ -690,8 +693,8 @@ export async function executeSchematicComponentMutation(
           }
           observed[key] = values;
         } else {
-          if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error(`${key} readback mismatch.`);
-          observed[key] = actual === undefined ? null : actual;
+          if (actual !== expected) throw new Error(`${key} readback mismatch.`);
+          observed[key] = actual;
         }
       }
       return {

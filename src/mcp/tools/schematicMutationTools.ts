@@ -65,8 +65,8 @@ export function registerSchematicMutationTools(server: McpServer, bridge: Editor
         rotation: z.number().optional().describe("Rotation angle in degrees (0, 90, 180, 270)"),
         mirror: z.boolean().optional().describe("Mirror state"),
         subPartName: z.string().optional().describe("Sub-part name for multi-part components"),
-        addIntoBom: z.boolean().default(true).describe("Whether to include in BOM"),
-        addIntoPcb: z.boolean().default(true).describe("Whether to forward to PCB"),
+        addIntoBom: z.boolean().optional().describe("Whether to include in BOM"),
+        addIntoPcb: z.boolean().optional().describe("Whether to forward to PCB"),
         timeoutMs: DefaultTimeoutSchema.default(30_000)
       },
       annotations: {

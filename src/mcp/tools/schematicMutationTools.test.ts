@@ -438,3 +438,19 @@ it("exposes scoped read/reconcile tools as read-only and forwards exact identiti
   await client.callTool({ name: "easyeda_reconcile_schematic_pcb_sync", arguments: { mutationId: "receipt" } });
   expect(bridge.call).toHaveBeenLastCalledWith("reconcileSchematicPcbSync", { mutationId: "receipt" }, 60000);
 });
+
+it("does not inject create-only BOM or PCB defaults into an update", async () => {
+  const bridge = {
+    endpoint: "ws://127.0.0.1:8765",
+    getStatus: (): EditorStatus => ({ connected: true, updatedAt: new Date().toISOString() }),
+    call: vi.fn(async () => ({ mutationId: "update-receipt", confirmation: "confirm", preview: {} }))
+  };
+  const client = await makeClient(bridge);
+  await client.callTool({ name: "easyeda_prepare_schematic_component", arguments: {
+    action: "update", component: "R1", properties: { name: "new" }
+  } });
+  expect(bridge.call).toHaveBeenCalled();
+  const params = bridge.call.mock.calls[0]![1] as Record<string, unknown>;
+  expect(params.addIntoBom).toBeUndefined();
+  expect(params.addIntoPcb).toBeUndefined();
+});

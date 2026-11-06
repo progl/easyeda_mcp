@@ -504,6 +504,30 @@ describe("generic schematic update native contract", () => {
     });
   }
 
+  it("verifies explicit top-level native update fields alongside properties", async () => {
+    const f = fixture(true);
+    const p = await prepareSchematicComponentMutation(f.api, {
+      action: "update", component: "R1", properties: { name: "new" },
+      addIntoBom: false, addIntoPcb: false, subPartName: "B", uniqueId: "stable-id"
+    });
+    const result: any = await f.handlers.confirmedAction({
+      action: "mutation", params: { mutationId: p.mutationId }, confirmation: p.confirmation
+    });
+    expect(result.status).toBe("applied");
+    expect(result.after.properties).toEqual({
+      name: "new", addIntoBom: false, addIntoPcb: false, subPartName: "B", uniqueId: "stable-id"
+    });
+  });
+  it("does not change omitted top-level BOM or PCB flags", async () => {
+    const f = fixture(true);
+    f.state.addIntoBom = false;
+    f.state.addIntoPcb = false;
+    const result: any = await confirm(f, { name: "new" });
+    expect(result.status).toBe("applied");
+    expect(f.modify).toHaveBeenCalledWith("part-a", { name: "new" });
+    expect(f.state.addIntoBom).toBe(false);
+    expect(f.state.addIntoPcb).toBe(false);
+  });
   it.each(["package-a", { uuid: "new-footprint", libraryUuid: "personal", name: "package-a" }])(
     "rejects unsupported footprint changes before dispatch (%j)",
     async (footprint) => {
@@ -683,5 +707,26 @@ it("does not treat an absent readback field as proof of a requested null reset",
   });
   expect(result.status).toBe("unknown");
   expect(result.error).toMatch(/manufacturer.*unavailable/);
+  expect(modify).toHaveBeenCalledTimes(1);
+});
+
+it("does not treat an undefined native getter result as a verified null reset", async () => {
+  extensionMutations.invalidateAll();
+  const modify = vi.fn(async () => ({ manufacturer: null }));
+  const api = () => ({
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "getter-reset-sheet", documentType: 1 }) },
+    sch_PrimitiveComponent: {
+      modify,
+      getAll: async () => [{ primitiveId: "getter-reset-part", designator: "R1", x: 1, y: 2,
+        getState_Manufacturer: () => undefined }]
+    }
+  });
+  const p = await prepareSchematicComponentMutation(api, {
+    action: "update", component: "R1", properties: { manufacturer: null }
+  });
+  const result: any = await createActionHandlers(api, new DrcRules(api)).confirmedAction({
+    action: "mutation", params: { mutationId: p.mutationId }, confirmation: p.confirmation
+  });
+  expect(result.status).toBe("unknown");
   expect(modify).toHaveBeenCalledTimes(1);
 });
