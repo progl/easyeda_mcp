@@ -15,6 +15,27 @@ export function ok(summary: string, structuredContent: Record<string, unknown>):
   };
 }
 
+/** Keep full recovery state machine-readable without duplicating large plans in UI text. */
+export function mutationOk(
+  summary: string,
+  structuredContent: Record<string, unknown>,
+  record: Record<string, unknown>
+): ToolResult {
+  const brief: Record<string, unknown> = { recoveryData: "Complete operation and journal are in structuredContent." };
+  for (const key of ["mutationId", "domain", "action", "status", "phase", "documentSaved", "execution"])
+    if (record[key] !== undefined) brief[key] = record[key];
+  if (typeof record.error === "string") brief.error = record.error.slice(0, 2500);
+  if (record.after && typeof record.after === "object") {
+    const after = record.after as Record<string, unknown>;
+    brief.readback = Object.fromEntries(
+      ["verified", "identityPreserved", "nativeConnectivityVerified", "saved"]
+        .filter((key) => after[key] !== undefined)
+        .map((key) => [key, after[key]])
+    );
+  }
+  return { content: [{ type: "text", text: renderText(summary, brief) }], structuredContent };
+}
+
 export function fail(error: unknown): ToolResult {
   const payload = normalizeError(error);
   return {

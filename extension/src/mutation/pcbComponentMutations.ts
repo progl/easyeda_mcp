@@ -2,6 +2,8 @@ import { apiError, ensureApi, isNumber, isRecord, numeric, optionalCall, toArray
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
 import type { EasyEdaApi } from "../types.js";
+import { executePcbPlacements } from "./pcbPlacementReadback.js";
+import { pcbUnits, pcbToNative } from "../pcbUnits.js";
 
 export type ResolvedPcbComponent = {
   primitiveId: string;
@@ -113,26 +115,27 @@ export async function preparePcbComponentMutation(
   const comp = await findComponentInPcb(api, componentIdentifier);
 
   if (action === "move") {
+    const inputUnits = pcbUnits(params.units);
     let toX = comp.x;
     let toY = comp.y;
 
     if (isNumber(params.x)) {
-      toX = Number(params.x);
+      toX = pcbToNative(Number(params.x), inputUnits);
     } else if (isNumber(params.dx)) {
-      toX = comp.x + Number(params.dx);
+      toX = comp.x + pcbToNative(Number(params.dx), inputUnits);
     }
 
     if (isNumber(params.y)) {
-      toY = Number(params.y);
+      toY = pcbToNative(Number(params.y), inputUnits);
     } else if (isNumber(params.dy)) {
-      toY = comp.y + Number(params.dy);
+      toY = comp.y + pcbToNative(Number(params.dy), inputUnits);
     }
 
     if (toX === comp.x && toY === comp.y) {
       throw apiError("no_effective_change", `Move operation for component ${comp.designator} results in no change.`);
     }
 
-    const impact = `Moves PCB component ${comp.designator} (${comp.primitiveId}) from (${comp.x}, ${comp.y}) to (${toX}, ${toY}).`;
+    const impact = `Moves PCB component ${comp.designator} (${comp.primitiveId}) from (${comp.x}, ${comp.y}) to (${toX}, ${toY}) native mil (input units: ${inputUnits}).`;
     const preview = {
       impact,
       scope: `document:${currentTarget.documentId ?? "active_pcb"}`,
@@ -149,10 +152,13 @@ export async function preparePcbComponentMutation(
         action: "move",
         primitiveId: comp.primitiveId,
         designator: comp.designator,
+        target: currentTarget,
         fromX: comp.x,
         fromY: comp.y,
         toX,
-        toY
+        toY,
+        inputUnits,
+        units: "mil"
       },
       before: preview.requestedBefore,
       requestedAfter: preview.requestedAfter,
@@ -166,6 +172,8 @@ export async function preparePcbComponentMutation(
       mutationId: record.mutationId,
       confirmation: record.confirmation,
       action: "move",
+      units: "mil",
+      inputUnits,
       preview: record.preview,
       expiresAt: record.expiresAt
     };
@@ -334,40 +342,17 @@ export async function executePcbComponentMutation(
   const eda = api();
 
   if (op.action === "move") {
-    if (eda.pcb_PrimitiveComponent?.modify) {
-      await eda.pcb_PrimitiveComponent.modify(op.primitiveId, { x: op.toX, y: op.toY });
-    } else if (eda.pcb_PrimitiveComponent?.get) {
-      const comp = await eda.pcb_PrimitiveComponent.get(op.primitiveId);
-      if (!comp) {
-        throw apiError("component_not_found", `PCB component ${op.primitiveId} not found for move.`);
+    const result = await executePcbPlacements(
+      api,
+      [{ primitiveId: op.primitiveId, designator: op.designator, x: op.toX, y: op.toY }],
+      {
+        target: op.target,
+        expectedBefore: isRecord(_expectedBefore) ? _expectedBefore : undefined
       }
-      const asyncComp = comp.toAsync ? comp.toAsync() : comp;
-      if (asyncComp.setState_X) await asyncComp.setState_X(op.toX);
-      if (asyncComp.setState_Y) await asyncComp.setState_Y(op.toY);
-      if (asyncComp.done) await asyncComp.done();
-    } else {
-      ensureApi("pcb_PrimitiveComponent", "modify", eda);
-    }
-
-    const updated = await findComponentInPcb(api, op.primitiveId);
-    const verified = Math.abs(updated.x - op.toX) <= 1 && Math.abs(updated.y - op.toY) <= 1;
-
-    if (!verified) {
-      throw apiError(
-        "readback_verification_failed",
-        `Move readback failed for ${op.designator}. Expected (${op.toX}, ${op.toY}), got (${updated.x}, ${updated.y}).`
-      );
-    }
-
+    );
     return {
       executed: true,
-      readback: {
-        primitiveId: updated.primitiveId,
-        designator: updated.designator,
-        x: updated.x,
-        y: updated.y,
-        verified: true
-      }
+      readback: { ...result, ...result.placements[0], primitiveId: op.primitiveId, designator: op.designator }
     };
   }
 

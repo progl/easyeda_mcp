@@ -3,7 +3,7 @@ import type { EditorClient } from "../../editor/EditorClient.js";
 import { PROTOCOL_VERSION } from "../../protocol/messages.js";
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION } from "../../version.js";
 import { ok } from "../toolResult.js";
-import { DefaultTimeoutSchema, doctorNextSteps, registerReadTool } from "./common.js";
+import { DefaultTimeoutSchema, DocumentTargetSchema, doctorNextSteps, registerReadTool } from "./common.js";
 
 export function registerStatusTools(server: McpServer, bridge: EditorClient): void {
   server.registerTool(
@@ -99,6 +99,9 @@ export function registerStatusTools(server: McpServer, bridge: EditorClient): vo
       "Summarizes active project, active document, selection, and editor context from the open EasyEDA Pro instance.",
     method: "getContext",
     inputSchema: {
+      target: DocumentTargetSchema.optional().describe(
+        "Expected active project/document identity for context and Board-link diagnostics."
+      ),
       timeoutMs: DefaultTimeoutSchema
     },
     summary: "Fetched EasyEDA Pro context."

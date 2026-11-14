@@ -1,8 +1,20 @@
+import { executePcb3dTransform } from "../mutation/pcb3dTransformMutations.js";
+import { executePcbFreeTextDelete } from "../mutation/pcbFreeTextMutations.js";
+import { executeMechanicalPad } from "../mutation/mechanicalPadMutations.js";
+import { executeLegacyDeviceRecreate } from "../mutation/schematicLegacyRecreate.js";
+import { executeSchematicPrune } from "../mutation/schematicPrune.js";
+import { executeBoardOperation } from "../mutation/boardOperations.js";
+import { executeSchematicPageCopy, executeSchematicPageDelete } from "../mutation/schematicPageCopies.js";
+import { executeSchematicDeviceReplace } from "../mutation/schematicDeviceReplace.js";
+import { executePcbAnnotationMutation } from "../mutation/pcbAnnotationMutations.js";
+import { executeSchematicPage } from "../mutation/schematicPages.js";
+import { executeBlockTransfer } from "../mutation/schematicBlockTransfer.js";
 import type { DrcRules } from "../drcRules.js";
 import { apiError, ensureApi, optionalCall, pickString } from "../helpers.js";
 import { extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "../mutation/mutationManager.js";
 import { executeBoardOutlineMutation } from "../mutation/pcbOutlineMutations.js";
+import { executeMountingHoles } from "../mutation/pcbMountingHoles.js";
 import { executePcbComponentMutation } from "../mutation/pcbComponentMutations.js";
 import { executePcbCopperKeepoutMutation } from "../mutation/pcbCopperKeepoutMutations.js";
 import { executePcbExternalImportMutation } from "../mutation/pcbExternalImportMutations.js";
@@ -10,6 +22,7 @@ import { executePcbNetConstraintMutation } from "../mutation/pcbNetConstraintMut
 import {
   executePcbLayoutMutation,
   executePcbRoutingMutation,
+  getNativeRoutingObservation,
   fetchLayoutSummary,
   fetchRoutingSummary
 } from "../mutation/pcbRoutingMutations.js";
@@ -38,11 +51,33 @@ export function createActionHandlers(
       let executeFn: () => Promise<boolean | void> = async () => true;
       let readbackFn: () => Promise<unknown> = async () => record.before;
 
-      if (record.domain === "schematic") {
+      if (record.domain === "project" && ["copyBoard", "renameBoard"].includes(record.action)) {
+        let resultReadback: Record<string, unknown> = {};
+        executeFn = async () => {
+          const result = await executeBoardOperation(api, record);
+          resultReadback = result.readback;
+          return result.executed;
+        };
+        readbackFn = async () => resultReadback;
+      } else if (record.domain === "schematic") {
         let resultReadback: Record<string, unknown> = {};
         executeFn = async () => {
           let res: { executed: boolean; readback: Record<string, unknown> };
-          if (["createWire", "modifyWire", "deleteWire", "addNetLabel"].includes(record.action)) {
+          if (["legacyDeviceStage", "legacyDeviceCommit"].includes(record.action)) {
+            res = await executeLegacyDeviceRecreate(api, record);
+          } else if (record.action === "prunePage") {
+            res = await executeSchematicPrune(api, record);
+          } else if (record.action === "replaceDevice") {
+            res = await executeSchematicDeviceReplace(api, record);
+          } else if (record.action === "schematicPage") {
+            res = await executeSchematicPage(record, api);
+          } else if (record.action === "copySchematicPage") {
+            res = await executeSchematicPageCopy(api, record);
+          } else if (record.action === "deleteSchematicPage") {
+            res = await executeSchematicPageDelete(api, record);
+          } else if (record.action === "transferBlock") {
+            res = await executeBlockTransfer(record, api);
+          } else if (["createWire", "modifyWire", "deleteWire", "addNetLabel"].includes(record.action)) {
             res = await executeSchematicWireMutation(record, api);
           } else if (["createPort", "modifyPort", "deletePort"].includes(record.action)) {
             res = await executeSchematicPortMutation(record, api);
@@ -69,8 +104,22 @@ export function createActionHandlers(
         let resultReadback: Record<string, unknown> = {};
         executeFn = async () => {
           let res: { executed: boolean; readback: Record<string, unknown> };
-          if (["autoroute", "unroute"].includes(record.action)) {
-            res = await executePcbRoutingMutation(api, (record as any).operation ?? record, record.before);
+          if (["createAnnotations", "modifyAnnotations", "deleteAnnotations"].includes(record.action)) {
+            res = await executePcbAnnotationMutation(api, record);
+          } else if (record.action === "setPcbComponent3dTransform") {
+            res = await executePcb3dTransform(api, record);
+          } else if (record.action === "deleteExplicitFreePcbTexts") {
+            res = await executePcbFreeTextDelete(api, record);
+          } else if (["createStandaloneNpth", "moveStandaloneNpth", "deleteStandaloneNpth"].includes(record.action)) {
+            res = await executeMechanicalPad(api, record);
+          } else if (record.action === "createMountingHoles") {
+            res = await executeMountingHoles(api, record);
+          } else if (["autoroute", "unroute"].includes(record.action)) {
+            res = await executePcbRoutingMutation(
+              api,
+              { ...((record as any).operation ?? record), mutationId: record.mutationId, target: record.target },
+              record.before
+            );
           } else if (record.action === "autolayout") {
             res = await executePcbLayoutMutation(api, (record as any).operation ?? record, record.before);
           } else if (["setBoardOutline", "clearBoardOutline", "modifyBoardOutline"].includes(record.action)) {
@@ -102,11 +151,19 @@ export function createActionHandlers(
           ) {
             res = await executePcbNetConstraintMutation(api, (record as any).operation ?? record, record.before);
           } else if (record.action === "import_external") {
-            res = await executePcbExternalImportMutation(api, (record as any).operation ?? record, record.before);
+            res = await executePcbExternalImportMutation(
+              api,
+              { ...((record as any).operation ?? record), mutationId: record.mutationId, target: record.target },
+              record.before
+            );
           } else if (
             ["createTrack", "modifyTrack", "deleteTrack", "createVia", "modifyVia", "deleteVia"].includes(record.action)
           ) {
-            res = await executePcbTrackViaMutation(api, (record as any).operation ?? record, record.before);
+            res = await executePcbTrackViaMutation(
+              api,
+              { ...((record as any).operation ?? record), mutationId: record.mutationId, target: record.target },
+              record.before
+            );
           } else {
             res = await executePcbComponentMutation(api, (record as any).operation ?? record, record.before);
           }
@@ -131,25 +188,19 @@ export function createActionHandlers(
     const documentUuid = pickString(documentInfo, ["uuid", "documentUuid", "id"]);
 
     if (action === "save") {
-      if (eda.pcb_Document?.save) {
-        await eda.pcb_Document.save(documentUuid);
-        return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
-      }
-      if (eda.sch_Document?.save) {
-        await eda.sch_Document.save(documentUuid);
-        return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
-      }
+      const type = extractDocumentIdentity(documentInfo).documentType;
+      const documentApi = type === "schematic" ? eda.sch_Document : type === "pcb" ? eda.pcb_Document : undefined;
+      if (!documentApi?.save) throw apiError("capability_unavailable", `Save API is unavailable for ${type}.`);
+      const result = await documentApi.save(documentUuid);
+      if (result === false) throw apiError("save_failed", "Native document save returned false.");
+      return { action, saved: true, documentUuid, target: extractDocumentIdentity(documentInfo) };
     }
 
     if (action === "importChanges") {
-      ensureApi("pcb_Document", "importChanges", eda);
-      await eda.pcb_Document.importChanges(params.uuid ?? documentUuid);
-      return {
-        action,
-        imported: true,
-        documentUuid: params.uuid ?? documentUuid,
-        target: extractDocumentIdentity(documentInfo)
-      };
+      throw apiError(
+        "prepared_mutation_required",
+        "Schematic-to-PCB import requires easyeda_prepare_schematic_pcb_sync action:'syncToPcb' with explicit projectId, boardName, schematicUuid, pcbUuid and protectedBoardName, then its exact mutation confirmation. Query/reconcile an unknown import read-only; never repeat it automatically."
+      );
     }
 
     if (action === "autoroute" || action === "nativeAutoRoute") {
@@ -165,19 +216,10 @@ export function createActionHandlers(
         };
       }
 
-      if (!eda.pcb_Document?.autoRouting && !eda.pcb_Document?.autoRoute) {
-        ensureApi("pcb_Document", "autoRouting", eda);
-      }
-      const routeFn = eda.pcb_Document.autoRouting ?? eda.pcb_Document.autoRoute;
-      await routeFn(params.params ?? {});
-      const routingStatus = await fetchRoutingSummary(api);
-      return {
-        action: "autoroute",
-        method: "native",
-        routed: true,
-        routingStatus,
-        target: extractDocumentIdentity(documentInfo)
-      };
+      throw apiError(
+        "prepared_mutation_required",
+        "Native autorouting requires easyeda_prepare_pcb_routing followed by action:'mutation' and its exact confirmation. Query that mutationId after a deadline; never restart an unknown native router task."
+      );
     }
 
     if (action === "autolayout" || action === "nativeAutoLayout") {
@@ -265,7 +307,10 @@ export function createActionHandlers(
 
   function getMutationResult(params: Record<string, any>): Record<string, unknown> {
     const mutationId = String(params.mutationId ?? "");
-    return mutations.get(mutationId);
+    const record = mutations.get(mutationId);
+    return record.domain === "pcb" && record.action === "autoroute"
+      ? { ...record, nativeTask: getNativeRoutingObservation(mutationId, record.status) }
+      : record;
   }
 
   return {

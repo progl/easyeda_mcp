@@ -150,10 +150,10 @@ describe("pcbBoardReports", () => {
       pcb_PrimitiveLine: {
         getAll: vi.fn(async () => [
           // Board outline rectangle 0,0 to 100,100
-          { layer: 10, getState_Layer: () => 10, startX: 0, startY: 0, endX: 100, endY: 0 },
-          { layer: 10, getState_Layer: () => 10, startX: 100, startY: 0, endX: 100, endY: 100 },
-          { layer: 10, getState_Layer: () => 10, startX: 100, startY: 100, endX: 0, endY: 100 },
-          { layer: 10, getState_Layer: () => 10, startX: 0, startY: 100, endX: 0, endY: 0 }
+          { layer: 11, getState_Layer: () => 11, startX: 0, startY: 0, endX: 100, endY: 0 },
+          { layer: 11, getState_Layer: () => 11, startX: 100, startY: 0, endX: 100, endY: 100 },
+          { layer: 11, getState_Layer: () => 11, startX: 100, startY: 100, endX: 0, endY: 100 },
+          { layer: 11, getState_Layer: () => 11, startX: 0, startY: 100, endX: 0, endY: 0 }
         ])
       },
       ...overrides
@@ -224,6 +224,44 @@ describe("pcbBoardReports", () => {
   });
 
   describe("generatePcbPlacementReport", () => {
+    it("reads real asynchronous pad envelopes in mil and reports physical dimensions in mm", async () => {
+      const getAllPinsByPrimitiveId = vi.fn(async () => [
+        { x: 900, y: -500, pad: ["RECT", 100, 60, 0], rotation: 0 },
+        { x: 1100, y: -500, pad: ["RECT", 100, 60, 0], rotation: 0 }
+      ]);
+      const report = await generatePcbPlacementReport(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => pcbDocInfo },
+        pcb_PrimitiveComponent: {
+          getAll: async () => [{ primitiveId: "a1", designator: "A1", x: 1000, y: -500, layer: 1 }],
+          getAllPinsByPrimitiveId
+        }
+      }));
+      expect(getAllPinsByPrimitiveId).toHaveBeenCalledWith("a1");
+      expect(report.components[0]).toMatchObject({
+        geometrySource: "pad_envelope",
+        units: "mm",
+        x: 25.4,
+        y: -12.7,
+        width: 7.62,
+        height: 1.524,
+        padCount: 2
+      });
+      expect(report.totalComponentAreaMm2).toBeCloseTo(11.61, 2);
+      expect(report).toMatchObject({ units: "mm", nativeUnits: "mil", geometryVerified: false });
+    });
+
+    it("does not invent 2x2 geometry or a clean collision result when dimensions are unavailable", async () => {
+      const report = await generatePcbPlacementReport(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => pcbDocInfo },
+        pcb_PrimitiveComponent: {
+          getAll: async () => [{ primitiveId: "a1", designator: "A1", x: 1000, y: -500, layer: 1 }]
+        }
+      }));
+      expect(report.components[0].width).toBeUndefined();
+      expect(report.totalComponentAreaMm2).toBeUndefined();
+      expect(report).toMatchObject({ collisionCheckComplete: false, geometryVerified: false });
+      expect((report as any).unknownGeometryComponents).toHaveLength(1);
+    });
     it("detects component bounding boxes, collisions, and out-of-boundary components", async () => {
       const api = createMockApi();
       const report = await generatePcbPlacementReport(() => api as any, { collisionTolerance: 0.2 });
@@ -249,7 +287,7 @@ describe("pcbBoardReports", () => {
       expect(report.layerDistribution.bottom).toBe(0);
 
       // Density calculation against 100x100mm board (10000mm²)
-      expect(report.boardAreaMm2).toBe(10000);
+      expect(report.boardAreaMm2).toBeCloseTo(6.4516);
       expect(report.densityPercent).toBeGreaterThan(0);
     });
   });

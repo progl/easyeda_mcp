@@ -2,6 +2,7 @@ import { apiError, isNumber, isRecord, numeric, optionalCall, sanitize, toArray 
 import { assertDocumentTargetMatch, extractDocumentIdentity } from "../identity.js";
 import { extensionMutations } from "./mutationManager.js";
 import type { EasyEdaApi } from "../types.js";
+import { pcbUnits, pcbToNative } from "../pcbUnits.js";
 
 export type BoardOutlineSegment = {
   primitiveId: string;
@@ -27,6 +28,7 @@ export type BoardOutlineBounds = {
 
 export type BoardOutlineSummary = {
   target: Record<string, unknown>;
+  units: "mil";
   layer: { id: number | string; name: string };
   exists: boolean;
   segmentCount: number;
@@ -71,7 +73,7 @@ export async function resolveBoardOutlineLayer(eda: EasyEdaApi): Promise<{ id: n
           name.toLowerCase().includes("boardoutline") ||
           type.includes("outline") ||
           type.includes("boardoutline") ||
-          id === 10 ||
+          id === 11 ||
           id === "BoardOutline"
         ) {
           return { id, name: name || "BoardOutline" };
@@ -81,13 +83,13 @@ export async function resolveBoardOutlineLayer(eda: EasyEdaApi): Promise<{ id: n
       // fallback
     }
   }
-  return { id: 10, name: "BoardOutline" };
+  return { id: 11, name: "BoardOutline" };
 }
 
 function checkSegmentsClosed(segments: BoardOutlineSegment[]): boolean {
   if (segments.length < 3) return false;
 
-  const tolerance = 0.5; // 0.5 mm tolerance
+  const tolerance = 0.5; // Native mil tolerance
   const pointsMatch = (x1: number, y1: number, x2: number, y2: number) =>
     Math.abs(x1 - x2) <= tolerance && Math.abs(y1 - y2) <= tolerance;
 
@@ -153,7 +155,7 @@ export async function getBoardOutlineSummary(
     const layer = getProp(raw, "getState_Layer", ["layer", "layerId", "layerNo"]);
     if (layer === outlineLayer.id) return true;
     const layerStr = String(layer ?? "").toLowerCase();
-    return layerStr.includes("outline") || layerStr === "10" || layer === 10;
+    return layerStr.includes("outline") || layerStr === "11" || layer === 11;
   };
 
   // 1. Line primitives
@@ -235,6 +237,43 @@ export async function getBoardOutlineSummary(
   }
 
   // Calculate geometry & bounds
+  // BOARD_OUTLINE is a native graphical Polyline, not a copper-track Line.
+  // Do not silently report an unreadable polygon as an absent board outline.
+  if (eda.pcb_PrimitivePolyline?.getAll) {
+    for (const raw of toArray(await eda.pcb_PrimitivePolyline.getAll())) {
+      if (!isOutlineLayerMatch(raw)) continue;
+      const primitiveId = String(getProp(raw, "getState_PrimitiveId", ["primitiveId", "id"]) ?? "");
+      const polygon = getProp(raw, "getState_Polygon", ["polygon"]);
+      const source = typeof polygon?.getSource === "function" ? polygon.getSource() : undefined;
+      let points: number[] = [];
+      if (Array.isArray(source) && typeof source[0] === "number") {
+        points = source.filter((value: unknown) => value !== "L");
+      } else if (Array.isArray(source) && source[0] === "R" && !source[5] && !source[6]) {
+        const [, x, y, w, h] = source;
+        points = [x, y, x + w, y, x + w, y + h, x, y + h, x, y];
+      }
+      if (points.length < 4 || points.length % 2 || !points.every(Number.isFinite))
+        throw apiError(
+          "unsupported_outline_geometry",
+          `Cannot inspect board outline polyline ${primitiveId}; no mutation is safe.`
+        );
+      for (let i = 0; i < points.length - 2; i += 2) {
+        segments.push({
+          primitiveId,
+          type: "polyline",
+          startX: points[i],
+          startY: points[i + 1],
+          endX: points[i + 2],
+          endY: points[i + 3],
+          layer: outlineLayer.id,
+          lineWidth: numeric(getProp(raw, "getState_LineWidth", ["lineWidth"])),
+          locked: Boolean(getProp(raw, "getState_PrimitiveLock", ["primitiveLock", "locked"]))
+        });
+      }
+      if (options.includeRaw) rawPrimitives.push(sanitize(raw) as Record<string, unknown>);
+    }
+  }
+
   let minX = 0;
   let minY = 0;
   let maxX = 0;
@@ -260,6 +299,7 @@ export async function getBoardOutlineSummary(
   const isClosed = checkSegmentsClosed(segments);
 
   return {
+    units: "mil",
     target: currentTarget as Record<string, unknown>,
     layer: outlineLayer,
     exists: segments.length > 0,
@@ -284,6 +324,17 @@ export async function prepareBoardOutlineMutation(
   api: () => EasyEdaApi,
   params: Record<string, any>
 ): Promise<Record<string, unknown>> {
+  const inputUnits = pcbUnits(params.units);
+  if (inputUnits === "mm") {
+    params = { ...params, lineWidth: params.lineWidth ?? 0.2 };
+    for (const key of ["x", "y", "width", "height", "lineWidth", "startX", "startY", "endX", "endY"])
+      if (typeof params[key] === "number") params[key] = pcbToNative(params[key], inputUnits);
+    if (Array.isArray(params.points))
+      params.points = params.points.map((p: any) => ({
+        x: pcbToNative(p.x, inputUnits),
+        y: pcbToNative(p.y, inputUnits)
+      }));
+  }
   const eda = api();
   const documentInfo = await optionalCall(() => eda.dmt_SelectControl?.getCurrentDocumentInfo?.());
   const currentTarget = extractDocumentIdentity(documentInfo);
@@ -304,6 +355,9 @@ export async function prepareBoardOutlineMutation(
   const beforeSummary = await getBoardOutlineSummary(api);
 
   if (action === "set_rectangle" || action === "create") {
+    const createOnly = action === "create";
+    if (createOnly && beforeSummary.exists)
+      throw apiError("outline_already_exists", "Board outline already exists; create-only does not modify it.");
     const x = isNumber(params.x) ? Number(params.x) : 0;
     const y = isNumber(params.y) ? Number(params.y) : 0;
     const width = numeric(params.width);
@@ -317,7 +371,7 @@ export async function prepareBoardOutlineMutation(
     }
 
     const lineWidth = isNumber(params.lineWidth) ? Number(params.lineWidth) : 0.2;
-    const clearExisting = params.clearExisting !== false;
+    const clearExisting = action === "create" ? false : params.clearExisting !== false;
 
     const requestedBounds = {
       minX: x,
@@ -328,7 +382,7 @@ export async function prepareBoardOutlineMutation(
       height
     };
 
-    const impact = `Sets rectangular board outline ${width}x${height}mm at (${x}, ${y}) on layer ${outlineLayer.name} (clearing existing: ${clearExisting}).`;
+    const impact = `Sets rectangular board outline ${width}x${height}mil at (${x}, ${y}) on layer ${outlineLayer.name} (clearing existing: ${clearExisting}).`;
     const preview = {
       impact,
       scope: `document:${currentTarget.documentId ?? "active_pcb"}`,
@@ -353,6 +407,7 @@ export async function prepareBoardOutlineMutation(
       target: currentTarget,
       operation: {
         action: "set_rectangle",
+        createOnly,
         x,
         y,
         width,
@@ -370,6 +425,8 @@ export async function prepareBoardOutlineMutation(
     });
 
     return {
+      units: "mil",
+      inputUnits,
       mutationId: record.mutationId,
       confirmation: record.confirmation,
       action: "setBoardOutline",
@@ -446,6 +503,8 @@ export async function prepareBoardOutlineMutation(
     });
 
     return {
+      units: "mil",
+      inputUnits,
       mutationId: record.mutationId,
       confirmation: record.confirmation,
       action: "setBoardOutline",
@@ -493,6 +552,8 @@ export async function prepareBoardOutlineMutation(
     });
 
     return {
+      units: "mil",
+      inputUnits,
       mutationId: record.mutationId,
       confirmation: record.confirmation,
       action: "clearBoardOutline",
@@ -512,6 +573,11 @@ export async function prepareBoardOutlineMutation(
     if (!existingSeg) {
       throw apiError("segment_not_found", `Board outline segment "${primitiveId}" was not found.`);
     }
+    if (existingSeg.type !== "line")
+      throw apiError(
+        "unsupported_action",
+        "Individual edges of a native polyline cannot be modified with the line API; replace the outline through a new preview."
+      );
 
     const updates: Record<string, any> = {};
     if (isNumber(params.startX)) updates.startX = Number(params.startX);
@@ -560,6 +626,8 @@ export async function prepareBoardOutlineMutation(
     });
 
     return {
+      units: "mil",
+      inputUnits,
       mutationId: record.mutationId,
       confirmation: record.confirmation,
       action: "modifyBoardOutline",
@@ -583,14 +651,26 @@ export async function executeBoardOutlineMutation(
   const eda = api();
   const outlineLayer = await resolveBoardOutlineLayer(eda);
 
-  if (op.action === "clear") {
+  async function clearOutline(): Promise<void> {
     const existing = await getBoardOutlineSummary(api);
-    if (existing.segments.length > 0 && eda.pcb_PrimitiveLine?.delete) {
-      const ids = existing.segments.map((s) => s.primitiveId).filter(Boolean);
-      if (ids.length > 0) {
-        await eda.pcb_PrimitiveLine.delete(ids);
-      }
+    const groups = [
+      ["line", eda.pcb_PrimitiveLine],
+      ["arc", eda.pcb_PrimitiveArc],
+      ["polyline", eda.pcb_PrimitivePolyline]
+    ] as const;
+    // Check every required API before deleting any primitive.
+    for (const [type, sdk] of groups)
+      if (existing.segments.some((s) => s.type === type) && !sdk?.delete)
+        throw apiError("unsupported_api", `Board outline ${type} deletion API is unavailable.`);
+    for (const [type, sdk] of groups) {
+      const ids = [...new Set(existing.segments.filter((s) => s.type === type).map((s) => s.primitiveId))];
+      if (ids.length && (await sdk.delete(ids)) === false)
+        throw apiError("readback_verification_failed", `Board outline ${type} deletion failed; do not retry blindly.`);
     }
+  }
+
+  if (op.action === "clear") {
+    await clearOutline();
 
     const readback = await getBoardOutlineSummary(api);
     if (readback.segmentCount > 0) {
@@ -608,17 +688,11 @@ export async function executeBoardOutlineMutation(
   }
 
   if (op.action === "set_rectangle" || op.action === "set_polygon") {
-    // 1. Clear existing segments if requested
-    if (op.clearExisting) {
-      const existing = await getBoardOutlineSummary(api);
-      if (existing.segments.length > 0 && eda.pcb_PrimitiveLine?.delete) {
-        const ids = existing.segments.map((s) => s.primitiveId).filter(Boolean);
-        if (ids.length > 0) {
-          await eda.pcb_PrimitiveLine.delete(ids);
-        }
-      }
-    }
-
+    if (op.createOnly && (await getBoardOutlineSummary(api)).exists)
+      throw apiError(
+        "stale_mutation",
+        "Board outline already exists or changed after create-only preview; nothing was overwritten."
+      );
     // 2. Build vertices
     let points: { x: number; y: number }[];
     if (op.action === "set_rectangle") {
@@ -633,19 +707,34 @@ export async function executeBoardOutlineMutation(
       points = op.points;
     }
 
-    // 3. Create lines connecting consecutive vertices
-    if (!eda.pcb_PrimitiveLine?.create) {
-      throw apiError("unsupported_api", "EasyEDA Pro API method pcb_PrimitiveLine.create is unavailable.");
+    // Construct and validate the native polygon before any destructive clearing.
+    if (!eda.pcb_PrimitivePolyline?.create || !eda.pcb_MathPolygon?.createPolygon) {
+      throw apiError(
+        "unsupported_api",
+        "Board outlines require pcb_PrimitivePolyline.create and pcb_MathPolygon.createPolygon."
+      );
     }
+    const polygon = eda.pcb_MathPolygon.createPolygon([
+      points[0].x,
+      points[0].y,
+      "L",
+      ...points.slice(1).flatMap((p) => [p.x, p.y]),
+      points[0].x,
+      points[0].y
+    ]);
+    if (!polygon)
+      throw apiError("invalid_outline_geometry", "Native SDK rejected the outline polygon before mutation.");
+    if (op.clearExisting) await clearOutline();
 
     const layerId = op.layerId ?? outlineLayer.id;
     const lineWidth = op.lineWidth ?? 0.2;
 
-    for (let i = 0; i < points.length; i++) {
-      const p1 = points[i];
-      const p2 = points[(i + 1) % points.length];
-      await eda.pcb_PrimitiveLine.create("", layerId, p1.x, p1.y, p2.x, p2.y, lineWidth, false);
-    }
+    const created = await eda.pcb_PrimitivePolyline.create("", layerId, polygon, lineWidth, false);
+    if (!created)
+      throw apiError(
+        "readback_verification_failed",
+        "Native outline creation returned no primitive; inspect before retrying."
+      );
 
     // 4. Zoom to board outline if supported
     if (eda.pcb_Document?.zoomToBoardOutline) {
@@ -654,7 +743,7 @@ export async function executeBoardOutlineMutation(
 
     // 5. Readback verification
     const readback = await getBoardOutlineSummary(api);
-    if (readback.segmentCount !== points.length) {
+    if (readback.segmentCount !== points.length || !readback.isClosed) {
       throw apiError(
         "readback_verification_failed",
         `Board outline segment count mismatch. Expected ${points.length}, found ${readback.segmentCount}.`
@@ -664,10 +753,11 @@ export async function executeBoardOutlineMutation(
     if (op.action === "set_rectangle") {
       const widthMatch = Math.abs(readback.bounds.width - op.width) <= 1;
       const heightMatch = Math.abs(readback.bounds.height - op.height) <= 1;
-      if (!widthMatch || !heightMatch) {
+      const originMatch = Math.abs(readback.bounds.minX - op.x) <= 1 && Math.abs(readback.bounds.minY - op.y) <= 1;
+      if (!widthMatch || !heightMatch || !originMatch) {
         throw apiError(
           "readback_verification_failed",
-          `Board outline dimensions mismatch. Expected ${op.width}x${op.height}mm, got ${readback.bounds.width}x${readback.bounds.height}mm.`
+          `Board outline dimensions mismatch. Expected ${op.width}x${op.height}mil, got ${readback.bounds.width}x${readback.bounds.height}mil.`
         );
       }
     }
@@ -675,6 +765,7 @@ export async function executeBoardOutlineMutation(
     return {
       executed: true,
       readback: {
+        units: "mil",
         bounds: readback.bounds,
         segmentCount: readback.segmentCount,
         isClosed: readback.isClosed,

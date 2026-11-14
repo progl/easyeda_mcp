@@ -53,7 +53,8 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:extension": "tsc -p tsconfig.extension.json --noEmit --rootDir . --types node",
-    "test:smoke:drc": "npm run build && node scripts/smoke-drc.mjs"
+    "test:smoke:drc": "npm run build && node scripts/smoke-drc.mjs",
+    "dev:extension": "node scripts/dev-extension.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.4.0",

@@ -10,6 +10,7 @@ export interface DrcEvidence {
 
 export interface NormalizedDrcViolation {
   id: string;
+  code?: string;
   rule: string;
   category: string;
   message: string;
@@ -115,8 +116,9 @@ export function extractViolationCoordinates(
   rec: Record<string, unknown>,
   message: string
 ): { x?: number; y?: number; x2?: number; y2?: number } | undefined {
-  const directX = numeric(rec.x ?? rec.coordX ?? rec.x1);
-  const directY = numeric(rec.y ?? rec.coordY ?? rec.y1);
+  const pos = isRecord(rec.pos) ? rec.pos : {};
+  const directX = numeric(rec.x ?? rec.coordX ?? rec.x1 ?? pos.x);
+  const directY = numeric(rec.y ?? rec.coordY ?? rec.y1 ?? pos.y);
   const directX2 = numeric(rec.x2);
   const directY2 = numeric(rec.y2);
 
@@ -177,7 +179,7 @@ export function extractViolationNets(rec: Record<string, unknown>, message: stri
 export function extractViolationPrimitiveIds(rec: Record<string, unknown>, message: string): string[] {
   const ids = new Set<string>();
 
-  const rawIds = rec.primitiveIds ?? rec.primitiveId ?? rec.items ?? rec.objects ?? rec.ids;
+  const rawIds = rec.primitiveIds ?? rec.primitiveId ?? rec.items ?? rec.objects ?? rec.ids ?? rec.objs;
   if (Array.isArray(rawIds)) {
     for (const item of rawIds) {
       const s = stringOrUndefined(item);
@@ -202,8 +204,26 @@ export function extractViolationPrimitiveIds(rec: Record<string, unknown>, messa
  * Extracts structured evidence (actual value vs required/expected value).
  */
 export function extractViolationEvidence(rec: Record<string, unknown>, message: string): DrcEvidence | undefined {
-  let actual = rec.actual ?? rec.current ?? rec.real ?? rec.distance ?? rec.width ?? rec.value;
-  let expected = rec.expected ?? rec.required ?? rec.min ?? rec.limit ?? rec.ruleValue;
+  const explanation = isRecord(rec.explanation) ? rec.explanation : {};
+  const params = isRecord(explanation.param) ? explanation.param : {};
+  let actual =
+    params.minDistance ??
+    params.actual ??
+    rec.actual ??
+    rec.current ??
+    rec.real ??
+    rec.distance ??
+    rec.width ??
+    rec.value;
+  let expected =
+    params.shouldBe ??
+    params.required ??
+    params.min ??
+    rec.expected ??
+    rec.required ??
+    rec.min ??
+    rec.limit ??
+    rec.ruleValue;
 
   if (actual === undefined || expected === undefined) {
     // Attempt regex parsing from message:
@@ -219,6 +239,8 @@ export function extractViolationEvidence(rec: Record<string, unknown>, message: 
   }
 
   const evidence: DrcEvidence = {};
+  if (Object.keys(params).length) evidence.nativeExplanationParams = sanitize(params);
+  if (isRecord(explanation.errData)) evidence.nativeErrorData = sanitize(explanation.errData);
   if (actual !== undefined) evidence.actual = actual as string | number;
   if (expected !== undefined) evidence.expected = expected as string | number;
 
@@ -233,6 +255,20 @@ export function extractViolationEvidence(rec: Record<string, unknown>, message: 
   }
 
   return evidence;
+}
+
+/** Native verbose results are category/subcategory list trees, not individual violations. */
+export function flattenNativeDrcGroups(items: unknown[]): unknown[] {
+  const leaves: unknown[] = [];
+  const walk = (item: unknown, path: string[]) => {
+    if (isRecord(item) && Array.isArray(item.list)) {
+      const name = typeof item.name === "string" ? item.name : undefined;
+      for (const child of item.list) walk(child, name ? [...path, name] : path);
+    } else if (isRecord(item)) leaves.push({ ...item, nativeGroupPath: path });
+    else leaves.push(item);
+  };
+  items.forEach((item) => walk(item, []));
+  return leaves;
 }
 
 /**
@@ -262,11 +298,31 @@ export function normalizeDrcViolation(raw: unknown, index: number): NormalizedDr
   }
 
   const rec = isRecord(raw) ? (raw as Record<string, unknown>) : {};
-  const rawRule = pickString(rec, ["rule", "ruleCode", "code", "type", "ruleType", "name"]);
+  const rawRule = pickString(rec, [
+    "ruleTypeName",
+    "errorType",
+    "rule",
+    "ruleCode",
+    "code",
+    "type",
+    "ruleType",
+    "name"
+  ]);
+  const explanation = isRecord(rec.explanation) ? rec.explanation : {};
+  const params = isRecord(explanation.param) ? explanation.param : {};
+  const nativeMessage =
+    typeof explanation.str === "string"
+      ? explanation.str.replace(/\{([^}]+)\}/g, (whole, key) =>
+          Object.prototype.hasOwnProperty.call(params, key) ? String(params[key]) : whole
+        )
+      : undefined;
   const message =
-    pickString(rec, ["message", "desc", "description", "text", "detail", "error"]) ?? JSON.stringify(sanitize(rec));
+    nativeMessage ??
+    pickString(rec, ["message", "desc", "description", "text", "detail", "error"]) ??
+    JSON.stringify(sanitize(rec));
 
   const { rule, category } = classifyDrcRule(rawRule, message);
+  const code = pickString(rec, ["ruleTypeName", "ruleCode", "code", "errorType"]);
 
   const rawSeverity = String(rec.severity ?? rec.level ?? rec.type ?? "").toLowerCase();
   const severity: "error" | "warning" = rawSeverity.includes("warn") ? "warning" : "error";
@@ -282,6 +338,7 @@ export function normalizeDrcViolation(raw: unknown, index: number): NormalizedDr
   const id = pickString(rec, ["id", "violationId", "uuid"]) ?? `violation-${index + 1}`;
 
   return {
+    code,
     id,
     rule,
     category,

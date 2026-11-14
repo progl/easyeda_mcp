@@ -3,10 +3,25 @@ import { netNodeId } from "./normalization.js";
 
 export type NativeNetlistData = {
   status: "available" | "unavailable" | "unsupported" | "error";
-  format: "Protel2";
+  format: "Protel2" | "EasyEDA";
   text?: string;
   reason?: string;
   ambiguousDesignators?: string[];
+  scope?: {
+    kind: "active_schematic";
+    verified: boolean;
+    schematicUuid?: string;
+    projectId?: string;
+    boardName?: string;
+    requestedPins: "current_page" | "all_current_schematic";
+    evidence: string;
+  };
+  read?: {
+    timeoutMs: number;
+    durationMs: number;
+    timedOut: boolean;
+    attemptedFormats: Array<"Protel2" | "EasyEDA">;
+  };
 };
 
 // Protel2 uses [component records] and (net name, reference-pin records).
@@ -49,13 +64,84 @@ export function parseProtel2(text: string): Map<string, string[]> {
   return result;
 }
 
+export function parseNativeNetlist(text: string, format: "Protel2" | "EasyEDA"): Map<string, string[]> {
+  if (format === "Protel2") return parseProtel2(text);
+  if (text.length > 2_000_000) throw new Error("Native netlist exceeds 2 MB");
+  const data = JSON.parse(text.replace(/^\uFEFF/, ""));
+  if (
+    !data ||
+    typeof data !== "object" ||
+    !data.components ||
+    Array.isArray(data.components) ||
+    typeof data.components !== "object"
+  )
+    throw new Error("Unsupported EasyEDA JSON netlist");
+  const nets = new Map<string, string[]>();
+  const seen = new Set<string>();
+  for (const c of Object.values(data.components) as any[]) {
+    const ref = c?.props?.Designator;
+    if (
+      typeof ref !== "string" ||
+      !ref ||
+      !c.pinInfoMap ||
+      typeof c.pinInfoMap !== "object" ||
+      Array.isArray(c.pinInfoMap)
+    )
+      throw new Error("Malformed EasyEDA component record");
+    for (const [key, p] of Object.entries(c.pinInfoMap) as [string, any][]) {
+      const number = p?.number ?? p?.props?.["Pin Number"] ?? key;
+      if (typeof number !== "string" || !number || typeof p?.net !== "string")
+        throw new Error("Malformed EasyEDA pin record");
+      const member = `${ref}-${number}`;
+      if (seen.has(member)) throw new Error("Ambiguous duplicate EasyEDA pin member");
+      seen.add(member);
+      if (!p.net) continue; // Absence/NC does not imply a geometric disconnect.
+      const members = nets.get(p.net) ?? [];
+      members.push(member);
+      nets.set(p.net, members);
+    }
+  }
+  return nets;
+}
+
+/** Only references in this native export belong to its ambiguity domain. */
+export function nativeExportDuplicateDesignators(text: string, format: "Protel2" | "EasyEDA"): string[] {
+  const references: string[] = [];
+  if (format === "EasyEDA") {
+    const data = JSON.parse(text.replace(/^\uFEFF/, ""));
+    for (const component of Object.values(data.components) as any[]) references.push(component.props.Designator);
+  } else {
+    let inComponent = false,
+      first = true;
+    for (const line of text
+      .replace(/^\uFEFF/, "")
+      .split(/\r?\n/)
+      .map((v) => v.trim())
+      .filter(Boolean)) {
+      if (line === "[") {
+        inComponent = true;
+        first = true;
+      } else if (line === "]") inComponent = false;
+      else if (inComponent && first) {
+        references.push(line);
+        first = false;
+      }
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const reference of references) counts.set(reference, (counts.get(reference) ?? 0) + 1);
+  return [...counts].filter(([, n]) => n > 1).map(([reference]) => reference);
+}
+
 export function applyNativeNetlist(pins: SchematicPin[], data?: NativeNetlistData) {
   const report = {
     status: data?.status ?? "unavailable",
-    format: "Protel2" as const,
+    format: data?.format ?? "Protel2",
     matchedPins: 0,
     conflicts: 0,
-    reason: data?.reason
+    reason: data?.reason,
+    read: data?.read,
+    scope: data?.scope
   };
   const warnings: string[] = [];
   if (!data || data.status !== "available" || data.text === undefined) {
@@ -64,7 +150,7 @@ export function applyNativeNetlist(pins: SchematicPin[], data?: NativeNetlistDat
   }
   let nets: Map<string, string[]>;
   try {
-    nets = parseProtel2(data.text);
+    nets = parseNativeNetlist(data.text, data.format);
   } catch (error) {
     report.status = "unsupported";
     report.reason = error instanceof Error ? error.message : String(error);
@@ -120,11 +206,12 @@ export function applyNativeNetlist(pins: SchematicPin[], data?: NativeNetlistDat
         confidence: "high" as const,
         net,
         nodeId: netNodeId(net),
-        reason: "Exact unique designator and pin match in native Protel2 netlist"
+        reason: "Exact unique designator and pin match in native netlist"
       }
     };
   });
-  if (ambiguous.size) warnings.push("Native mapping skipped for duplicate project designators.");
+  if (ambiguous.size)
+    warnings.push("Native mapping skipped for duplicate designators within the native export/current schematic scope.");
   if (!report.matchedPins)
     warnings.push(
       "Native netlist contains no unambiguous matches for the collected pins; geometry remains a fallback."

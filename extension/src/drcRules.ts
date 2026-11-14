@@ -51,6 +51,55 @@ const fail = (code: string, message: string): never => {
 // A retained/public result wraps already validated rule data in preview metadata.
 const copy = <T>(value: T): T => JSON.parse(canonical(value, 64));
 
+// Bundled PCB DesignManager converts these dimensional fields through internal mil/10.
+// Deliberately not a generic tolerant JSON comparison: enums, counts, unknown fields,
+// all key sets and the pre-dispatch stale-state guard remain exact.
+function sameConvertedDrcConfiguration(actual: any, expected: any): boolean {
+  const index = (part: string) => /^(0|[1-9]\d*)$/.test(part);
+  const dimensional = (path: string[]): boolean => {
+    const [group, category, rule, ...rest] = path;
+    const unit = expected?.[group]?.[category]?.[rule]?.unit;
+    if (unit !== "mm" && unit !== "mil") return false;
+    return (
+      (group === "Physics" &&
+        category === "Track" &&
+        rest.length === 4 &&
+        rest[0] === "form" &&
+        rest[1] === "data" &&
+        index(rest[2]) &&
+        ["minValue", "defaultValue", "maxValue"].includes(rest[3])) ||
+      (group === "Spacing" &&
+        category === "Safe Spacing" &&
+        rest.length === 5 &&
+        rest[0] === "tables" &&
+        index(rest[1]) &&
+        rest[2] === "content" &&
+        index(rest[3]) &&
+        index(rest[4]))
+    );
+  };
+  const equal = (a: any, b: any, path: string[]): boolean => {
+    if (a === b) return true;
+    if (typeof a === "number" && typeof b === "number") {
+      if (
+        !Number.isFinite(a) ||
+        !Number.isFinite(b) ||
+        Number.isInteger(a) ||
+        Number.isInteger(b) ||
+        !dimensional(path)
+      )
+        return false;
+      return Math.abs(a - b) <= Math.min(1e-12, 4 * Number.EPSILON * Math.max(1, Math.abs(a), Math.abs(b)));
+    }
+    if (!a || !b || typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b))
+      return false;
+    const keys = Object.keys(a).sort();
+    if (canonical(keys) !== canonical(Object.keys(b).sort())) return false;
+    return keys.every((key) => equal(a[key], b[key], [...path, key]));
+  };
+  return equal(actual, expected, []);
+}
+
 /** Single-operation edits: no implicit save, replay or rollback. Retained only in this JS instance. */
 export class DrcRules {
   private edits = new Map<string, Edit>();
@@ -261,7 +310,9 @@ export class DrcRules {
         (op.type === "createConfiguration" && after?.name !== op.configurationName) ||
         canonical(await this.target()) !== canonical(edit.target) ||
         edit.generation !== this.generation ||
-        canonical(actual) !== canonical(expected)
+        !(op.type === "createConfiguration" || op.type === "updateCurrentConfiguration"
+          ? sameConvertedDrcConfiguration(actual, expected)
+          : canonical(actual) === canonical(expected))
       )
         fail("readback_mismatch", "DRC readback did not match the reviewed edit; do not retry");
       edit.status = "applied";

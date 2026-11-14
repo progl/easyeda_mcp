@@ -1,4 +1,6 @@
+import { detectBrowserIdentity } from "./browserIdentity.js";
 import type { BridgeErrorMessage, ProtocolCompatibility } from "../../src/protocol/messages.js";
+import { EXTENSION_VERSION } from "../../src/version.js";
 import { getBridgeUri, type ExtensionBridgeConfig } from "./bridgeConfig.js";
 import { optionalCall } from "./helpers.js";
 import { detectMethodCapabilities, extractDocumentIdentity } from "./identity.js";
@@ -35,7 +37,10 @@ export function detectCapabilities(
 export function isPermissionLikeError(error?: BridgeErrorMessage["error"]): boolean {
   const message = `${error?.message ?? ""} ${error?.code ?? ""}`.toLowerCase();
   return (
-    message.includes("permission") || message.includes("external interaction") || message.includes("sys_websocket")
+    message.includes("permission") ||
+    message.includes("external interaction") ||
+    message.includes("sys_websocket") ||
+    message.includes("外部交互权限")
   );
 }
 
@@ -62,8 +67,10 @@ export function formatStatusSummary(diagnostics: Record<string, unknown>, bridge
   const connection = (diagnostics.connection ?? {}) as Record<string, unknown>;
   const document = (diagnostics.activeDocument ?? {}) as Record<string, unknown>;
   return [
+    `Bridge version: ${EXTENSION_VERSION}`,
     `Bridge URI: ${bridgeUri}`,
     `Connection phase: ${String(connection.phase ?? "unknown")}`,
+    `Last error: ${String((connection.lastError as Record<string, unknown>)?.message ?? "none").slice(0, 500)}`,
     `Last open: ${String(connection.lastOpenAt ?? "never")}`,
     `Document: ${String(document.documentName ?? document.projectName ?? "none")}`
   ].join("\n");
@@ -76,10 +83,12 @@ export function formatDiagnostics(diagnostics: Record<string, unknown>, bridgeUr
   const nextSteps = Array.isArray(diagnostics.nextSteps) ? (diagnostics.nextSteps as string[]) : [];
 
   return [
+    `Bridge version: ${EXTENSION_VERSION}`,
     `Bridge URI: ${bridgeUri}`,
     `WebSocket register available: ${String(websocket.registerAvailable)}`,
     `WebSocket send available: ${String(websocket.sendAvailable)}`,
     `Connection phase: ${String(connection.phase ?? "unknown")}`,
+    `Last error: ${String((connection.lastError as Record<string, unknown>)?.message ?? "none").slice(0, 500)}`,
     `Last open: ${String(connection.lastOpenAt ?? "never")}`,
     `Last status: ${String(connection.lastStatusAt ?? "never")}`,
     `Compatibility: ${String((connection.compatibility as Record<string, unknown>)?.compatible ?? false)}`,
@@ -93,6 +102,7 @@ export async function collectDiagnostics(
   bridgeConfig: ExtensionBridgeConfig,
   state: {
     phase: string;
+    runtimeId?: string;
     connectedOnce: boolean;
     lastAttemptAt?: string;
     lastOpenAt?: string;
@@ -106,7 +116,9 @@ export async function collectDiagnostics(
   const documentInfo = await optionalCall(() => eda.dmt_SelectControl?.getCurrentDocumentInfo?.());
   const documentIdentity = extractDocumentIdentity(documentInfo);
   return {
+    browserIdentity: detectBrowserIdentity(),
     bridge: {
+      version: EXTENSION_VERSION,
       uri: getBridgeUri(bridgeConfig),
       config: bridgeConfig
     },
@@ -115,6 +127,7 @@ export async function collectDiagnostics(
       sendAvailable: Boolean(eda.sys_WebSocket?.send)
     },
     connection: {
+      runtimeId: state.runtimeId,
       phase: state.phase,
       connectedOnce: state.connectedOnce,
       lastAttemptAt: state.lastAttemptAt,

@@ -319,3 +319,31 @@ describe("exportTools", () => {
     await client.close();
   });
 });
+
+it("forwards Gerber returnData through the public tool", async () => {
+  const bridge: any = {
+    endpoint: "local",
+    getStatus: () => ({ connected: true }),
+    call: vi.fn(async () => ({ saved: false, returned: true, dataBase64: "UEs=" }))
+  };
+  const server = new McpServer({ name: "test", version: "1" });
+  registerExportTools(server, bridge);
+  const client = new Client({ name: "test", version: "1" });
+  const [c, s] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(s), client.connect(c)]);
+  try {
+    const result = await client.callTool({
+      name: "easyeda_export_gerber",
+      arguments: { returnData: true, fileName: "board" }
+    });
+    expect(result.isError).toBeFalsy();
+    expect(bridge.call).toHaveBeenCalledWith(
+      "exportGerber",
+      expect.objectContaining({ returnData: true, fileName: "board" }),
+      60000
+    );
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});

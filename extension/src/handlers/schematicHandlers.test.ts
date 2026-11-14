@@ -152,6 +152,77 @@ describe("Extension Schematic Handlers - Native Nets and ERC", () => {
   });
 
   describe("runSchematicErc", () => {
+    it.each([undefined, false, true])(
+      "forwards showResults=%s to native ERC without changing aggregates",
+      async (showResults) => {
+        const check = vi.fn(async () => [{ type: "warn", count: 5 }]);
+        const handlers = createSchematicHandlers(() => ({
+          dmt_SelectControl: { getCurrentDocumentInfo: async () => baseDocInfo },
+          sch_Drc: { check }
+        }));
+        const result: any = await handlers.runSchematicErc(showResults === undefined ? {} : { showResults });
+        expect(check).toHaveBeenCalledExactlyOnceWith(true, showResults === true, true);
+        expect(result).toMatchObject({ errorsCount: 0, warningsCount: 5, violationsCount: 5, detailsComplete: false });
+        expect(result.violations).toEqual([]);
+      }
+    );
+    it("preserves showResults in the older two-argument ERC fallback", async () => {
+      const check = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("verbose unsupported"))
+        .mockResolvedValueOnce([{ type: "warn", count: 5 }]);
+      const handlers = createSchematicHandlers(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: async () => baseDocInfo },
+        sch_Drc: { check }
+      }));
+      const result: any = await handlers.runSchematicErc({ strict: false, showResults: true });
+      expect(check.mock.calls).toEqual([
+        [false, true, true],
+        [false, true]
+      ]);
+      expect(result).toMatchObject({ errorsCount: 0, warningsCount: 5, detailsComplete: false });
+    });
+
+    it("preserves aggregate warning counts without inventing detailed violations", async () => {
+      const handlers = createSchematicHandlers(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: vi.fn(async () => baseDocInfo) },
+        sch_Drc: { check: vi.fn(async () => [{ type: "warn", count: 6 }]) }
+      }));
+      const result = (await handlers.runSchematicErc({})) as any;
+      expect(result).toMatchObject({ errorsCount: 0, warningsCount: 6, violationsCount: 6, detailsComplete: false });
+      expect(result.violations).toEqual([]);
+      expect(result.warnings).toContain(
+        "Native ERC returned aggregate counts; individual violation details are unavailable."
+      );
+    });
+
+    it("combines aggregate error and warning counts accurately", async () => {
+      const handlers = createSchematicHandlers(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: vi.fn(async () => baseDocInfo) },
+        sch_Drc: {
+          check: vi.fn(async () => [
+            { type: "error", count: 2 },
+            { type: "warn", count: 6 }
+          ])
+        }
+      }));
+      const result = (await handlers.runSchematicErc({})) as any;
+      expect(result).toMatchObject({ passed: false, errorsCount: 2, warningsCount: 6, violationsCount: 8 });
+      expect(result.violations).toEqual([]);
+    });
+
+    it("rejects invalid aggregate counts as inconclusive instead of a clean pass", async () => {
+      const handlers = createSchematicHandlers(() => ({
+        dmt_SelectControl: { getCurrentDocumentInfo: vi.fn(async () => baseDocInfo) },
+        sch_Drc: { check: vi.fn(async () => [{ type: "warn", count: -1 }]) }
+      }));
+      expect(await handlers.runSchematicErc({})).toMatchObject({
+        passed: false,
+        status: "inconclusive",
+        detailsComplete: false
+      });
+    });
+
     it("reports clean pass when sch_Drc.check returns no violations", async () => {
       const mockApi = {
         dmt_SelectControl: {
@@ -203,6 +274,8 @@ describe("Extension Schematic Handlers - Native Nets and ERC", () => {
       expect(result.passed).toBe(false);
       expect(result.status).toBe("violations_found");
       expect(result.violationsCount).toBe(2);
+      expect(result.errorsCount).toBe(1);
+      expect(result.warningsCount).toBe(1);
       expect(result.violations[0]).toMatchObject({
         rule: "floating_pin",
         message: "Pin U1.5 is floating without connection",

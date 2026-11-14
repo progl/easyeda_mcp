@@ -12,6 +12,8 @@ export type PrepareMutationOptions<TOperation = Record<string, unknown>, TData =
   operation: TOperation;
   before: TData;
   requestedAfter: unknown;
+  /** Compact review only; complete immutable proof remains in record.before. */
+  previewBefore?: unknown;
   changedKeys?: string[];
   scope: string;
   impact?: string;
@@ -47,6 +49,43 @@ export class MutationLifecycle {
     });
   }
   private generation = 0;
+
+  // Observes this bridge lifecycle only. It cannot inspect EasyEDA's global/native RPC queue.
+  getExecutionState(): {
+    lockHeld: boolean;
+    activeMutationId?: string;
+    activeStatus?: string;
+    activePhase?: string;
+    preparedCount: number;
+    prepared: { mutationId: string; domain: string; action: string; expiresAt: string }[];
+    unresolvedCount: number;
+    unresolved: { mutationId: string; domain: string; action: string; status: string }[];
+  } {
+    const active = this.activeMutationId ? this.mutations.get(this.activeMutationId) : undefined;
+    const unresolved = [...this.mutations.values()].filter(
+      (record) => record.status === "unknown" || record.status === "running"
+    );
+    const prepared = [...this.mutations.values()].filter(
+      (r) => r.status === "prepared" && Date.now() <= Date.parse(r.expiresAt)
+    );
+    return {
+      preparedCount: prepared.length,
+      prepared: prepared
+        .slice(-20)
+        .map((r) => ({ mutationId: r.mutationId, domain: r.domain, action: r.action, expiresAt: r.expiresAt })),
+      lockHeld: this.busy,
+      ...(active
+        ? { activeMutationId: active.mutationId, activeStatus: active.status, activePhase: active.phase }
+        : {}),
+      unresolvedCount: unresolved.length,
+      unresolved: unresolved.slice(-20).map((record) => ({
+        mutationId: record.mutationId,
+        domain: record.domain,
+        action: record.action,
+        status: record.status
+      }))
+    };
+  }
 
   getGeneration(): number {
     return this.generation;
@@ -97,7 +136,8 @@ export class MutationLifecycle {
     }
 
     const preview: MutationPreview = {
-      before: beforeCopy,
+      before: options.previewBefore === undefined ? beforeCopy : copy(options.previewBefore),
+      ...(options.previewBefore === undefined ? {} : { beforeReference: "record.before" as const }),
       requestedAfter: afterCopy,
       ...(changedKeys ? { changedKeys } : {}),
       scope: options.scope,
@@ -124,8 +164,11 @@ export class MutationLifecycle {
       documentSaved: false
     };
 
+    // Validate/clone the entire outgoing receipt before registration. If its bounded
+    // serialization fails, there must be no orphan prepared record without an ID.
+    const prepared = this.public(record);
     this.mutations.set(mutationId, record);
-    return this.public(record);
+    return prepared;
   }
 
   get(mutationId: string): MutationRecord<any, any> {
@@ -291,6 +334,114 @@ export class MutationLifecycle {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  recordExecutionEvidence(mutationId: string, evidence: unknown): void {
+    const record = this.mutations.get(mutationId);
+    if (
+      !record ||
+      !this.busy ||
+      this.activeMutationId !== mutationId ||
+      record.phase !== "execute" ||
+      !["running", "unknown"].includes(record.status)
+    )
+      throw Object.assign(new Error("Execution evidence requires the original active executor."), {
+        code: "mutation_not_active"
+      });
+    record.executionEvidence = copy(evidence);
+  }
+
+  /** Verify evidence under the lifecycle lock, never re-enter the executor. RPC
+   * handlers must supply their own operation-specific independent read-only proof. */
+  async reconcileSettledUnknown(options: {
+    mutationId: string;
+    domain: string;
+    action: string;
+    originalRecord?: MutationRecord<any, any>;
+    /** Trusted handler opts into native-verified restoration of a missing applied receipt; never executor replay. */
+    allowVerifiedAppliedRestore?: boolean;
+    verify: (record: MutationRecord<any, any>) => Promise<unknown>;
+    /** Trusted operation-specific deterministic summary; required for compact-preview receipt recovery. */
+    summarizeBefore?: (before: any) => unknown;
+  }): Promise<MutationRecord<any, any>> {
+    if (this.busy) throw this.busyError();
+    const stored = this.mutations.get(options.mutationId);
+    const record = stored ?? (options.originalRecord ? copy(options.originalRecord) : undefined);
+    if (
+      !record ||
+      record.mutationId !== options.mutationId ||
+      record.domain !== options.domain ||
+      record.action !== options.action
+    )
+      throw Object.assign(new Error("Original mutation identity/domain/action is unavailable or mismatched."), {
+        code: "reconciliation_invalid"
+      });
+    if (
+      stored &&
+      options.originalRecord &&
+      (canonicalJson(stored.before) !== canonicalJson(options.originalRecord.before) ||
+        canonicalJson(stored.operation) !== canonicalJson(options.originalRecord.operation))
+    )
+      throw Object.assign(new Error("Original receipt differs from the stored mutation."), {
+        code: "reconciliation_invalid"
+      });
+    if (
+      !stored &&
+      (record.confirmation !== formatMutationConfirmation(record.domain, record.action, record.mutationId) ||
+        !record.preview ||
+        (record.preview.beforeReference === "record.before"
+          ? !options.summarizeBefore ||
+            canonicalJson(record.preview.before) !== canonicalJson(options.summarizeBefore(record.before))
+          : canonicalJson(record.preview.before) !== canonicalJson(record.before)))
+    )
+      throw Object.assign(
+        new Error(
+          "Recovery requires a complete original mutation receipt with matching confirmation and before preview."
+        ),
+        { code: "reconciliation_invalid" }
+      );
+    if (record.status === "applied" && stored) return this.public(stored);
+    const restoringApplied = !stored && options.allowVerifiedAppliedRestore === true && record.status === "applied";
+    if (
+      (record.status !== "unknown" && !restoringApplied) ||
+      record.phase !== "settled" ||
+      !record.startedAt ||
+      !Number.isFinite(Date.parse(record.startedAt)) ||
+      !record.settledAt ||
+      !Number.isFinite(Date.parse(record.settledAt)) ||
+      record.execution?.lockHeld === true
+    )
+      throw Object.assign(new Error("Only a settled unknown with no active executor can be reconciled."), {
+        code: "reconciliation_not_ready"
+      });
+    this.busy = true;
+    this.activeMutationId = record.mutationId;
+    try {
+      const evidence = await options.verify(this.public(record));
+      if (stored && (stored.status !== "unknown" || stored.phase !== "settled"))
+        throw Object.assign(new Error("Mutation changed during reconciliation."), { code: "reconciliation_not_ready" });
+      const originalError = record.error;
+      const previousStatus = record.status === "applied" ? "applied" : "unknown";
+      record.after = copy(evidence);
+      record.status = "applied";
+      record.phase = "settled";
+      record.generation = this.generation;
+      record.reconciliation = {
+        mode: "read_only",
+        reconciledAt: new Date().toISOString(),
+        previousStatus,
+        ...(originalError ? { originalError } : {}),
+        recoveredReceipt: !stored
+      };
+      delete record.error;
+      this.mutations.set(record.mutationId, record);
+    } finally {
+      if (this.activeMutationId === record.mutationId) {
+        this.busy = false;
+        this.activeMutationId = undefined;
+      }
+    }
+    return this.public(record);
   }
 
   markOutcomeUnknown(mutationId: string, error?: unknown): MutationRecord<any, any> {

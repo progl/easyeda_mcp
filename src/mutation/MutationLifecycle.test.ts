@@ -43,6 +43,97 @@ describe("MutationLifecycle", () => {
     expect(prepared.before.trackWidth).toBe(10);
   });
 
+  it("returns a compact preview while retaining the full immutable proof only once", () => {
+    const manager = new MutationLifecycle();
+    const before = { proof: "x".repeat(1100000) };
+    const record = manager.prepare({
+      domain: "sync",
+      action: "syncToPcb",
+      target: baseTarget,
+      operation: {},
+      before,
+      previewBefore: { proofChars: before.proof.length },
+      requestedAfter: { count: 1 },
+      scope: "pcb"
+    });
+    expect(record.before.proof).toBe(before.proof);
+    expect(record.preview.before).toEqual({ proofChars: 1100000 });
+    expect(record.preview.beforeReference).toBe("record.before");
+    expect(JSON.stringify(record).length).toBeLessThan(1200000);
+  });
+  it("failed return serialization never registers an undiscoverable prepared record", () => {
+    const manager = new MutationLifecycle();
+    expect(() =>
+      manager.prepare({
+        domain: "sync",
+        action: "syncToPcb",
+        target: baseTarget,
+        operation: {},
+        before: { proof: "x".repeat(1100000) },
+        requestedAfter: {},
+        scope: "pcb"
+      })
+    ).toThrow(/2,000,000/);
+    expect(manager.getExecutionState()).toMatchObject({ lockHeld: false, preparedCount: 0, unresolvedCount: 0 });
+  });
+  it("compact-preview recovery requires its trusted deterministic summary and full original before", async () => {
+    const first = new MutationLifecycle(),
+      summary = (v: any) => ({ proofChars: v.proof.length });
+    const r = first.prepare({
+      domain: "sync",
+      action: "syncToPcb",
+      target: baseTarget,
+      operation: {},
+      before: { proof: "real-proof" },
+      previewBefore: summary({ proof: "real-proof" }),
+      requestedAfter: {},
+      scope: "pcb"
+    });
+    const unknown = await first.apply({
+      mutationId: r.mutationId,
+      confirmation: r.confirmation,
+      currentTarget: baseTarget,
+      currentBefore: r.before,
+      execute: async () => {
+        throw Object.assign(new Error("late native apply"), { code: "write_readback_unknown" });
+      },
+      readback: async () => ({})
+    });
+    const recovered = new MutationLifecycle();
+    await expect(
+      recovered.reconcileSettledUnknown({
+        mutationId: r.mutationId,
+        domain: "sync",
+        action: "syncToPcb",
+        originalRecord: unknown,
+        verify: async () => ({ verified: true })
+      })
+    ).rejects.toMatchObject({ code: "reconciliation_invalid" });
+    const tampered = structuredClone(unknown);
+    tampered.preview.before = { proofChars: 1 };
+    await expect(
+      recovered.reconcileSettledUnknown({
+        mutationId: r.mutationId,
+        domain: "sync",
+        action: "syncToPcb",
+        originalRecord: tampered,
+        summarizeBefore: summary,
+        verify: async () => ({ verified: true })
+      })
+    ).rejects.toMatchObject({ code: "reconciliation_invalid" });
+    const result = await recovered.reconcileSettledUnknown({
+      mutationId: r.mutationId,
+      domain: "sync",
+      action: "syncToPcb",
+      originalRecord: unknown,
+      summarizeBefore: summary,
+      verify: async (record) => {
+        expect(record.before).toEqual({ proof: "real-proof" });
+        return { verified: true };
+      }
+    });
+    expect(result.status).toBe("applied");
+  });
   it("requires exact confirmation string to apply", async () => {
     const lifecycle = new MutationLifecycle();
     const prepared = lifecycle.prepare({
@@ -413,4 +504,103 @@ describe("mutation execution deadlines", () => {
       vi.useRealTimers();
     }
   });
+});
+
+it("exposes the observed execution lock and unresolved outcomes without draining native writes", async () => {
+  const manager = new MutationLifecycle();
+  const target: DocumentIdentity = {
+    documentId: "d",
+    documentType: "pcb",
+    capturedAt: new Date().toISOString(),
+    completeness: "partial",
+    source: "native_api",
+    fingerprint: "d"
+  };
+  const p = manager.prepare({
+    domain: "pcb",
+    action: "test",
+    target,
+    operation: {},
+    before: {},
+    requestedAfter: {},
+    scope: "test"
+  });
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const completion = manager.apply({
+    mutationId: p.mutationId,
+    confirmation: p.confirmation,
+    currentTarget: target,
+    currentBefore: {},
+    execute: async () => {
+      await pending;
+    },
+    readback: async () => ({})
+  });
+  expect(manager.getExecutionState()).toMatchObject({
+    lockHeld: true,
+    activeMutationId: p.mutationId,
+    activeStatus: "running"
+  });
+  release();
+  await completion;
+  expect(manager.getExecutionState()).toMatchObject({ lockHeld: false });
+  manager.markOutcomeUnknown(p.mutationId, "readback unavailable");
+  expect(manager.getExecutionState().unresolved).toEqual([
+    expect.objectContaining({ mutationId: p.mutationId, status: "unknown" })
+  ]);
+});
+it("never restores an external applied receipt by default and inserts only after trusted read-only proof", async () => {
+  const source = new MutationLifecycle(),
+    target: any = { projectId: "p", documentId: "page", documentType: "schematic" };
+  const p = source.prepare({
+    domain: "schematic",
+    action: "legacyDeviceStage",
+    target,
+    operation: { phase: "stage" },
+    before: { count: 1 },
+    requestedAfter: { count: 2 },
+    scope: "page"
+  });
+  const receipt = await source.apply({
+    mutationId: p.mutationId,
+    confirmation: p.confirmation,
+    currentTarget: target,
+    currentBefore: p.before,
+    execute: async () => true,
+    readback: async () => ({ count: 2 })
+  });
+  const recovered = new MutationLifecycle(),
+    verify = vi.fn(async () => ({ verified: true }));
+  const args = {
+    mutationId: p.mutationId,
+    domain: "schematic",
+    action: "legacyDeviceStage",
+    originalRecord: receipt,
+    verify
+  };
+  await expect(recovered.reconcileSettledUnknown(args)).rejects.toMatchObject({ code: "reconciliation_not_ready" });
+  expect(verify).not.toHaveBeenCalled();
+  expect(() => recovered.get(p.mutationId)).toThrow();
+  await expect(
+    recovered.reconcileSettledUnknown({
+      ...args,
+      allowVerifiedAppliedRestore: true,
+      verify: async () => {
+        expect(recovered.getExecutionState().lockHeld).toBe(true);
+        throw new Error("native changed");
+      }
+    })
+  ).rejects.toThrow("native changed");
+  expect(() => recovered.get(p.mutationId)).toThrow();
+  expect(recovered.getExecutionState().lockHeld).toBe(false);
+  const restored = await recovered.reconcileSettledUnknown({ ...args, allowVerifiedAppliedRestore: true });
+  expect(restored.reconciliation).toMatchObject({
+    previousStatus: "applied",
+    recoveredReceipt: true,
+    mode: "read_only"
+  });
+  expect(recovered.get(p.mutationId).after).toEqual({ verified: true });
 });

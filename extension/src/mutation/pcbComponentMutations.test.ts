@@ -75,6 +75,27 @@ describe("PCB Component Mutations", () => {
   });
 
   describe("preparePcbComponentMutation", () => {
+    it("converts explicit mm move coordinates to native mil while preserving native defaults", async () => {
+      const api = mockPcbApi([{ primitiveId: "prim_r1", designator: "R1", x: 100, y: 200, rotation: 0, layer: 1 }]);
+      const absolute = await preparePcbComponentMutation(api, {
+        action: "move",
+        component: "R1",
+        units: "mm",
+        x: 25.4,
+        y: -12.7
+      });
+      const operation = extensionMutations.get(String(absolute.mutationId)).operation as any;
+      expect(operation.toX).toBeCloseTo(1000);
+      expect(operation.toY).toBeCloseTo(-500);
+      expect(absolute).toMatchObject({ units: "mil", inputUnits: "mm" });
+      const relative = await preparePcbComponentMutation(api, {
+        action: "move",
+        component: "R1",
+        units: "mm",
+        dx: 2.54
+      });
+      expect((extensionMutations.get(String(relative.mutationId)).operation as any).toX).toBeCloseTo(200);
+    });
     const mockPcbApi =
       (components: any[] = []) =>
       () => ({
@@ -250,7 +271,9 @@ describe("PCB Component Mutations", () => {
         x: 100,
         y: 200,
         rotation: 0,
-        layer: 1
+        layer: 1,
+        footprint: { uuid: "fp" },
+        uniqueId: "uid"
       };
 
       const modifyMock = vi.fn(async (id: string, updates: any) => {
@@ -259,7 +282,11 @@ describe("PCB Component Mutations", () => {
       });
 
       const api = () => ({
+        dmt_SelectControl: {
+          getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "p", documentType: 3 })
+        },
         pcb_PrimitiveComponent: {
+          getAllPinsByPrimitiveId: async () => [],
           getAll: vi.fn(async () => [state]),
           modify: modifyMock
         }
@@ -290,7 +317,9 @@ describe("PCB Component Mutations", () => {
         x: 100,
         y: 200,
         rotation: 0,
-        layer: 1
+        layer: 1,
+        footprint: { uuid: "fp" },
+        uniqueId: "uid"
       };
 
       const setRotationMock = vi.fn(async (rot: number) => {
@@ -299,7 +328,11 @@ describe("PCB Component Mutations", () => {
       const doneMock = vi.fn(async () => true);
 
       const api = () => ({
+        dmt_SelectControl: {
+          getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "p", documentType: 3 })
+        },
         pcb_PrimitiveComponent: {
+          getAllPinsByPrimitiveId: async () => [],
           getAll: vi.fn(async () => [state]),
           get: vi.fn(async () => ({
             toAsync: () => ({
@@ -327,18 +360,24 @@ describe("PCB Component Mutations", () => {
       expect(doneMock).toHaveBeenCalled();
     });
 
-    it("throws readback_verification_failed if move did not reflect in state", async () => {
+    it("reports unknown without replay if native placement never persists", async () => {
       const state = {
         primitiveId: "prim_r1",
         designator: "R1",
         x: 100,
         y: 200,
         rotation: 0,
-        layer: 1
+        layer: 1,
+        footprint: { uuid: "fp" },
+        uniqueId: "uid"
       };
 
       const api = () => ({
+        dmt_SelectControl: {
+          getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "p", documentType: 3 })
+        },
         pcb_PrimitiveComponent: {
+          getAllPinsByPrimitiveId: async () => [],
           getAll: vi.fn(async () => [state]),
           modify: vi.fn(async () => {
             // Fails to update state
@@ -354,7 +393,7 @@ describe("PCB Component Mutations", () => {
           toX: 120,
           toY: 230
         })
-      ).rejects.toThrow(/Move readback failed/);
+      ).rejects.toThrow(/Do not replay/);
     });
 
     it("executes flip and delete, integrated via confirmed_action", async () => {
@@ -410,5 +449,50 @@ describe("PCB Component Mutations", () => {
       });
       expect(components).toHaveLength(0);
     });
+  });
+  it("waits for independent SDK state after an optimistic fire-and-forget single move return", async () => {
+    const state: any = {
+      primitiveId: "p1",
+      designator: "R1",
+      uniqueId: "uid",
+      footprint: { uuid: "fp" },
+      x: 0,
+      y: 0,
+      rotation: 0,
+      layer: 1
+    };
+    const snapshot = () =>
+      Object.fromEntries(
+        Object.entries(state).map(([key, v]) => [
+          `getState_${key[0].toUpperCase() + key.slice(1)}`,
+          () => structuredClone(v)
+        ])
+      );
+    const modify = vi.fn(async (_id: string, patch: any) => {
+      setTimeout(() => Object.assign(state, patch), 20);
+      return { getState_X: () => patch.x, getState_Y: () => patch.y };
+    });
+    const get = vi.fn(async () => snapshot());
+    const api = () => ({
+      dmt_SelectControl: {
+        getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "project", documentType: 3 })
+      },
+      pcb_PrimitiveComponent: {
+        getAll: async () => [snapshot()],
+        get,
+        getAllPinsByPrimitiveId: async () => [{ primitiveId: "pad", padNumber: "1", net: "GND" }],
+        modify
+      }
+    });
+    const result = await executePcbComponentMutation(api, {
+      action: "move",
+      primitiveId: "p1",
+      designator: "R1",
+      toX: 125,
+      toY: -50
+    });
+    expect(result.readback).toMatchObject({ verified: true, x: 125, y: -50, padNetlinksPreserved: true });
+    expect(modify).toHaveBeenCalledExactlyOnceWith("p1", { x: 125, y: -50 });
+    expect(get.mock.calls.length).toBeGreaterThan(2);
   });
 });

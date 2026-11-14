@@ -17,7 +17,7 @@ describe("PCB Native Layout & Routing Mutations", () => {
   });
 
   describe("fetchRoutingSummary", () => {
-    it("calculates routed and unrouted net counts and completion percent", async () => {
+    it("does not treat undocumented net metadata as independent connectivity proof", async () => {
       const api = () => ({
         dmt_SelectControl: {
           getCurrentDocumentInfo: vi.fn(async () => ({
@@ -39,10 +39,10 @@ describe("PCB Native Layout & Routing Mutations", () => {
 
       const summary = await fetchRoutingSummary(api);
       expect(summary.totalNets).toBe(4);
-      expect(summary.routedNets).toBe(2);
-      expect(summary.unroutedNets).toBe(2);
-      expect(summary.completionPercent).toBe(50);
-      expect(summary.unroutedNetNames).toEqual(["SDA", "SCL"]);
+      expect(summary.routedNets).toBeNull();
+      expect(summary.unroutedNets).toBeNull();
+      expect(summary.completionPercent).toBeNull();
+      expect(summary.unroutedNetNames).toBeNull();
     });
   });
 
@@ -108,25 +108,18 @@ describe("PCB Native Layout & Routing Mutations", () => {
       expect(prepared.confirmation).toBe(`CONFIRM pcb:autoroute ${prepared.mutationId}`);
       expect(prepared.action).toBe("autoroute");
       expect(prepared.preview).toMatchObject({
-        before: { totalNets: 4, routedNets: 2, unroutedNets: 2 },
+        before: { totalNets: 4, routedNets: null, unroutedNets: null },
         requestedAfter: { action: "autoroute", targetNets: ["SDA", "SCL"], keepExistingRoutes: true },
         changedKeys: ["routing", "routedNets", "completionPercent"]
       });
     });
 
-    it("prepares destructive unroute mutation", async () => {
-      const api = mockPcbApi();
-      const prepared = (await preparePcbRoutingMutation(api, {
-        action: "unroute"
-      })) as Record<string, any>;
-
-      expect(prepared.confirmation).toBe(`CONFIRM pcb:unroute ${prepared.mutationId}`);
-      expect(prepared.action).toBe("unroute");
-      expect(prepared.preview.impact).toMatch(/DESTRUCTIVE/);
-      expect(prepared.preview).toMatchObject({
-        before: { totalNets: 4, routedNets: 2 },
-        requestedAfter: { action: "unroute", clearedRoutes: true }
+    it("rejects implicit unroute before dispatch", async () => {
+      const api = vi.fn(() => {
+        throw new Error("must not invoke native API");
       });
+      await expect(preparePcbRoutingMutation(api, { action: "unroute", nets: ["GND"] })).rejects.toThrow(/explicit/i);
+      expect(api).not.toHaveBeenCalled();
     });
 
     it("rejects non-PCB document targets", async () => {
@@ -150,6 +143,7 @@ describe("PCB Native Layout & Routing Mutations", () => {
       let isRouted = false;
       const autoRoutingMock = vi.fn(async () => {
         isRouted = true;
+        return { success: true, totalNetsCount: 1, successNetsCount: 1, failedNets: [], duration: 10 };
       });
 
       const api = () => ({
@@ -180,59 +174,26 @@ describe("PCB Native Layout & Routing Mutations", () => {
       expect(result.executed).toBe(true);
       expect(autoRoutingMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          nets: ["VCC"],
-          keepExisting: true
+          RoutingNets: ["VCC"],
+          existingPrimitiveMode: "keep"
         })
       );
       expect(result.readback).toMatchObject({
         method: "native",
         totalNets: 2,
-        routedNets: 2,
-        completionPercent: 100,
-        verified: true
+        routedNets: null,
+        completionPercent: null,
+        nativeReportedSuccess: true,
+        verified: false
       });
     });
 
-    it("executes destructive unroute and verifies readback", async () => {
-      let unroutedState = false;
-      const unRouteMock = vi.fn(async () => {
-        unroutedState = true;
+    it("rejects direct implicit unroute without a prepared snapshot", async () => {
+      const api = vi.fn(() => {
+        throw new Error("must not invoke native API");
       });
-
-      const api = () => ({
-        pcb_Document: {
-          unRoute: unRouteMock
-        },
-        dmt_SelectControl: {
-          getCurrentDocumentInfo: vi.fn(async () => ({
-            uuid: "pcb-doc-1",
-            documentType: 3
-          }))
-        },
-        pcb_Net: {
-          getAllNetsName: vi.fn(async () => ["GND", "VCC"]),
-          getAllNets: vi.fn(async () => [
-            { name: "GND", isRouted: !unroutedState },
-            { name: "VCC", isRouted: !unroutedState }
-          ])
-        }
-      });
-
-      const result = await executePcbRoutingMutation(api, {
-        action: "unroute"
-      });
-
-      expect(result.executed).toBe(true);
-      expect(unRouteMock).toHaveBeenCalled();
-      expect(result.readback).toMatchObject({
-        method: "native",
-        unrouted: true,
-        totalNets: 2,
-        routedNets: 0,
-        unroutedNets: 2,
-        completionPercent: 0,
-        verified: true
-      });
+      await expect(executePcbRoutingMutation(api, { action: "unroute", nets: ["GND"] })).rejects.toThrow(/explicit/i);
+      expect(api).not.toHaveBeenCalled();
     });
   });
 
@@ -314,61 +275,280 @@ describe("PCB Native Layout & Routing Mutations", () => {
       expect(importMock).toHaveBeenCalledWith('{"routes":[]}');
 
       // 2. Native autoroute call without file
-      const nativeResult = (await actionHandlers.confirmedAction({
-        action: "nativeAutoRoute",
-        confirmation: "I confirm nativeAutoRoute"
-      })) as Record<string, any>;
-
-      expect(nativeResult.method).toBe("native");
-      expect(nativeRouteMock).toHaveBeenCalled();
+      await expect(
+        actionHandlers.confirmedAction({ action: "nativeAutoRoute", confirmation: "I confirm nativeAutoRoute" })
+      ).rejects.toThrow(/prepared|prepare/i);
+      expect(nativeRouteMock).not.toHaveBeenCalled();
     });
 
-    it("executes staged unroute via confirmed_action mutation", async () => {
-      let isUnrouted = false;
-      const api = () => ({
-        dmt_SelectControl: {
-          getCurrentDocumentInfo: vi.fn(async () => ({
-            uuid: "pcb-doc-1",
-            documentType: 3
-          }))
-        },
-        pcb_Document: {
-          unRoute: vi.fn(async () => {
-            isUnrouted = true;
-          })
-        },
-        pcb_Net: {
-          getAllNetsName: vi.fn(async () => ["GND", "VCC"]),
-          getAllNets: vi.fn(async () => [
-            { name: "GND", isRouted: !isUnrouted },
-            { name: "VCC", isRouted: !isUnrouted }
-          ])
-        }
+    it("rejects net-based unroute preparation without explicit IDs", async () => {
+      const api = vi.fn(() => {
+        throw new Error("must not invoke native API");
       });
+      await expect(preparePcbRoutingMutation(api, { action: "unroute", nets: ["GND"] })).rejects.toThrow(/explicit/i);
+      expect(api).not.toHaveBeenCalled();
+    });
+  });
+});
 
-      const prepared = (await preparePcbRoutingMutation(api, {
-        action: "unroute"
-      })) as Record<string, any>;
-
-      const actionHandlers = createActionHandlers(api, new DrcRules(api));
-      const confirmed = (await actionHandlers.confirmedAction({
+it("does not claim all nets routed from names, lengths, or empty net metadata", async () => {
+  for (const nets of [undefined, [], [{ net: "GND", length: 400 }]]) {
+    const report: any = await fetchRoutingSummary(() => ({
+      dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "p", documentType: 3 }) },
+      pcb_Net: { getAllNetsName: async () => ["GND"], ...(nets ? { getAllNets: async () => nets } : {}) }
+    }));
+    expect(report).toMatchObject({
+      totalNets: 1,
+      routedNets: null,
+      unroutedNets: null,
+      completionPercent: null,
+      verified: false,
+      status: "inconclusive"
+    });
+  }
+});
+it("uses the real SDK receiver and maps RoutingNets/remove without unsupported aliases", async () => {
+  const doc = {
+    autoRouting: vi.fn(async function (this: any, _props: any) {
+      expect(this).toBe(doc);
+      return { success: true, totalNetsCount: 1, successNetsCount: 1, failedNets: [], duration: 1 };
+    })
+  };
+  const r = await executePcbRoutingMutation(() => ({ pcb_Document: doc }), {
+    action: "autoroute",
+    nets: ["VCC"],
+    ignoreNets: ["NC"],
+    keepExistingRoutes: false
+  });
+  expect(doc.autoRouting).toHaveBeenCalledWith({
+    RoutingNets: ["VCC"],
+    ignoreNets: ["NC"],
+    existingPrimitiveMode: "remove"
+  });
+  expect(r.readback).toMatchObject({ nativeReportedSuccess: true, verified: false, drcVerified: false });
+});
+it("does not verify native success:false or turn an invalid native result into success", async () => {
+  const rejected = await executePcbRoutingMutation(
+    () => ({
+      pcb_Document: {
+        autoRouting: async () => ({
+          success: false,
+          totalNetsCount: 1,
+          successNetsCount: 0,
+          failedNets: ["GND"],
+          duration: 0
+        })
+      }
+    }),
+    { action: "autoroute" }
+  );
+  expect(rejected).toMatchObject({ executed: false, readback: { verified: false, nativeReportedSuccess: false } });
+  await expect(
+    executePcbRoutingMutation(() => ({ pcb_Document: { autoRouting: async () => undefined } }), { action: "autoroute" })
+  ).rejects.toMatchObject({ code: "write_readback_unknown" });
+});
+it("rejects undocumented autoRoute-only capability before dispatch", async () => {
+  const autoRoute = vi.fn();
+  await expect(
+    executePcbRoutingMutation(() => ({ pcb_Document: { autoRoute } }), { action: "autoroute" })
+  ).rejects.toThrow(/autoRouting/);
+  expect(autoRoute).not.toHaveBeenCalled();
+});
+it("observes a long native task after the unchanged lifecycle deadline, without replaying or claiming native job control", async () => {
+  vi.useFakeTimers();
+  let settle!: (value: any) => void;
+  const pending = new Promise<any>((resolve) => {
+    settle = resolve;
+  });
+  const autoRouting = vi.fn(() => pending);
+  const api = () => ({
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "p", documentType: 3 }) },
+    pcb_Document: { autoRouting, startAutoRouting: vi.fn(), getAutoJobStatus: vi.fn() },
+    pcb_Net: { getAllNetsName: async () => ["GND"] }
+  });
+  const handlers = createActionHandlers(api, new DrcRules(api));
+  let apply: Promise<any> | undefined;
+  try {
+    const prepared: any = await preparePcbRoutingMutation(api, { action: "autoroute", nets: ["GND"] });
+    apply = handlers.confirmedAction({
+      action: "mutation",
+      params: { mutationId: prepared.mutationId },
+      confirmation: prepared.confirmation
+    }) as Promise<any>;
+    await vi.advanceTimersByTimeAsync(45001);
+    const timed = await apply;
+    expect(timed.status).toBe("unknown");
+    expect(timed.execution.lockHeld).toBe(true);
+    const running: any = handlers.getMutationResult({ mutationId: prepared.mutationId });
+    expect(running.nativeTask).toMatchObject({ phase: "running", retryable: false, jobControl: "unsupported" });
+    await expect(
+      handlers.confirmedAction({
         action: "mutation",
-        confirmation: prepared.confirmation as string,
-        params: {
-          mutationId: prepared.mutationId as string
-        }
-      })) as Record<string, any>;
+        params: { mutationId: prepared.mutationId },
+        confirmation: prepared.confirmation
+      })
+    ).rejects.toThrow();
+    expect(autoRouting).toHaveBeenCalledTimes(1);
+    settle({ success: true, totalNetsCount: 1, successNetsCount: 1, failedNets: [], duration: 50000 });
+    await vi.advanceTimersByTimeAsync(1);
+    const finished: any = handlers.getMutationResult({ mutationId: prepared.mutationId });
+    expect(finished.status).toBe("applied");
+    expect(finished.nativeTask).toMatchObject({ phase: "settled", nativeReportedSuccess: true });
+    expect(finished.after).toMatchObject({ verified: false, completionPercent: null });
+    expect(autoRouting).toHaveBeenCalledTimes(1);
+  } finally {
+    settle?.({ success: false });
+    await vi.advanceTimersByTimeAsync(1);
+    vi.useRealTimers();
+  }
+});
+it("settles native success:false as a failed mutation with observable non-retryable task evidence", async () => {
+  const autoRouting = vi.fn(async () => ({
+    success: false,
+    totalNetsCount: 2,
+    successNetsCount: 0,
+    failedNets: ["VCC", "GND"],
+    duration: 10
+  }));
+  const api = () => ({
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "p", documentType: 3 }) },
+    pcb_Document: { autoRouting }
+  });
+  const handlers = createActionHandlers(api, new DrcRules(api));
+  const p: any = await preparePcbRoutingMutation(api, { action: "autoroute" });
+  await expect(
+    handlers.confirmedAction({ action: "mutation", params: { mutationId: p.mutationId }, confirmation: p.confirmation })
+  ).rejects.toMatchObject({ code: "write_unverified" });
+  const result: any = handlers.getMutationResult({ mutationId: p.mutationId });
+  expect(result.status).toBe("failed");
+  expect(result.nativeTask).toMatchObject({
+    phase: "settled",
+    nativeReportedSuccess: false,
+    completionVerified: false,
+    drcVerified: false,
+    retryable: false,
+    reported: { totalNetsCount: 2, successNetsCount: 0, failedNets: ["VCC", "GND"] }
+  });
+  expect(autoRouting).toHaveBeenCalledTimes(1);
+});
 
-      expect(confirmed.status).toBe("applied");
-      expect(confirmed.domain).toBe("pcb");
-      expect(confirmed.action).toBe("unroute");
-      expect(confirmed.after).toMatchObject({
-        method: "native",
-        unrouted: true,
-        routedNets: 0,
-        unroutedNets: 2,
-        verified: true
-      });
+describe("default autoroute exclusions retain complete net metadata", () => {
+  beforeEach(() => extensionMutations.invalidateAll());
+  function nativeFixture() {
+    const names = ["GND", "SIGNAL"];
+    const pads = [
+      { primitiveId: "p1", net: "PAD_ONLY" },
+      { primitiveId: "p2", net: "GND2" },
+      { primitiveId: "p3", net: "SIGNAL" }
+    ];
+    const tracks = [{ primitiveId: "line1", net: "TRACK_ONLY" }];
+    const vias = [{ primitiveId: "via1", net: "VIA_ONLY" }];
+    const eda: any = {
+      dmt_SelectControl: {
+        getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "project", documentType: 3 })
+      },
+      pcb_Net: { getAllNetsName: async () => names },
+      pcb_PrimitiveComponent: {
+        getAll: async () => [{ primitiveId: "c1" }],
+        getAllPinsByPrimitiveId: async () => pads
+      },
+      pcb_PrimitiveLine: { getAll: async () => tracks },
+      pcb_PrimitiveVia: { getAll: async () => vias },
+      pcb_Document: { autoRouting: vi.fn(async () => ({ success: true })) }
+    };
+    return { api: () => eda, eda, names, pads, tracks, vias };
+  }
+  const excluded = { action: "autoroute", ignoreNets: ["GND", "GND2"], keepExistingRoutes: true };
+  const allNames = ["GND", "GND2", "PAD_ONLY", "SIGNAL", "TRACK_ONLY", "VIA_ONLY"];
+  it("materializes the native union while previewing the effective routing selection separately", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const record: any = extensionMutations.get(p.mutationId);
+    expect(record.operation.nets).toEqual(allNames);
+    expect(record.before.routingNetContext).toMatchObject({
+      scope: "net_membership_only",
+      allNetNames: allNames,
+      counts: { components: 1, pads: 3, tracks: 1, vias: 1 }
     });
+    expect(p.preview.requestedAfter).toMatchObject({
+      targetNets: ["PAD_ONLY", "SIGNAL", "TRACK_ONLY", "VIA_ONLY"],
+      sdkRoutingNets: allNames,
+      routingContext: { mode: "materialized_default", geometryVerified: false }
+    });
+    await executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before);
+    expect(f.eda.pcb_Document.autoRouting).toHaveBeenCalledExactlyOnceWith({
+      RoutingNets: allNames,
+      ignoreNets: ["GND", "GND2"],
+      existingPrimitiveMode: "keep"
+    });
+  });
+  it.each(["names", "pads", "tracks", "vias"] as const)(
+    "refuses changed %s membership before the one native write, even when counts are unchanged",
+    async (kind) => {
+      const f = nativeFixture();
+      const p: any = await preparePcbRoutingMutation(f.api, excluded);
+      const record: any = extensionMutations.get(p.mutationId);
+      if (kind === "names") f.names[0] = "RENAMED";
+      else f[kind][0].net = "RENAMED";
+      await expect(
+        executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before)
+      ).rejects.toMatchObject({ code: "stale_routing_context" });
+      expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+    }
+  );
+  it("refuses incomplete native component-pad enumeration before preparing an unsafe fallback", async () => {
+    const f = nativeFixture();
+    delete f.eda.pcb_PrimitiveComponent.getAllPinsByPrimitiveId;
+    await expect(preparePcbRoutingMutation(f.api, excluded)).rejects.toMatchObject({
+      code: "routing_context_unavailable"
+    });
+    expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+  });
+  it("does not reinterpret an explicit subset and warns that native metadata completeness is unverified", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, { ...excluded, nets: ["SIGNAL"] });
+    expect(extensionMutations.get(p.mutationId).operation.nets).toEqual(["SIGNAL"]);
+    expect(p.preview.requestedAfter.routingContext).toMatchObject({
+      mode: "caller_explicit_selection",
+      metadataCompleteness: "not_verified"
+    });
+    expect(p.preview.requestedAfter.routingContext.warnings.join(" ")).toMatch(/metadata/i);
+  });
+  it("refuses an excluded default without its prepared membership proof", async () => {
+    const f = nativeFixture();
+    await expect(executePcbRoutingMutation(f.api, excluded)).rejects.toMatchObject({
+      code: "prepared_routing_context_required"
+    });
+    expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+  });
+  it("never dispatches after a timed-out native context read eventually resolves", async () => {
+    const f = nativeFixture();
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const record: any = extensionMutations.get(p.mutationId);
+    vi.useFakeTimers();
+    try {
+      let finish!: (value: any) => void;
+      f.eda.pcb_PrimitiveComponent.getAll = () => new Promise((resolve) => (finish = resolve));
+      const execute = executePcbRoutingMutation(f.api, { ...record.operation, target: record.target }, record.before);
+      const check = expect(execute).rejects.toMatchObject({ code: "routing_context_unavailable" });
+      await vi.advanceTimersByTimeAsync(10001);
+      await check;
+      finish([{ primitiveId: "c1" }]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.eda.pcb_Document.autoRouting).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("keeps a rejected native call unknown and never replays the materialized default", async () => {
+    const f = nativeFixture();
+    f.eda.pcb_Document.autoRouting.mockRejectedValue(new Error("RPC Call autoRouting Timed Out"));
+    const p: any = await preparePcbRoutingMutation(f.api, excluded);
+    const handlers = createActionHandlers(f.api, new DrcRules(f.api));
+    const request = { action: "mutation", params: { mutationId: p.mutationId }, confirmation: p.confirmation };
+    const result = await handlers.confirmedAction(request);
+    expect(result).toMatchObject({ status: "unknown" });
+    await expect(handlers.confirmedAction(request)).rejects.toThrow();
+    expect(f.eda.pcb_Document.autoRouting).toHaveBeenCalledTimes(1);
   });
 });

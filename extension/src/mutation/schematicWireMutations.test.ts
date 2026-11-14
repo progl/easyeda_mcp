@@ -298,6 +298,7 @@ describe("Schematic Wire & Net Label Mutations", () => {
 
     it("executes addNetLabel and verifies readback", async () => {
       const api = () => ({
+        sys_Environment: { getEditorCurrentVersion: () => "4.1.60" },
         dmt_SelectControl: {
           getCurrentDocumentInfo: vi.fn(async () => ({
             uuid: "sch-doc-1",
@@ -406,4 +407,85 @@ describe("native wire rename readback", () => {
       expect(modify).toHaveBeenCalledTimes(1);
     }
   );
+});
+
+describe("EasyEDA 3.x net label compatibility", () => {
+  it("never invokes the v4-only label method on a legacy runtime", async () => {
+    const createNetLabel = vi.fn(async () => undefined);
+    const api = () => ({
+      sys_Environment: { getEditorCurrentVersion: vi.fn(() => "3.2.209") },
+      sch_PrimitiveAttribute: { createNetLabel }
+    });
+    await expect(
+      executeSchematicWireMutation(
+        {
+          operation: {
+            action: "addNetLabel",
+            kind: "label",
+            net: "CLK",
+            x: 1,
+            y: 2
+          }
+        } as any,
+        api
+      )
+    ).rejects.toThrow(/4|unsupported|unavailable/i);
+    expect(createNetLabel).not.toHaveBeenCalled();
+  });
+});
+
+describe("SDK replacement wire modification", () => {
+  beforeEach(() => extensionMutations.invalidateAll());
+  function fixture() {
+    const wire = { primitiveId: "w1", line: [0, 0, 20, 0], net: "GND", color: "#123456", lineWidth: 2, lineType: 1 };
+    const eda = {
+      dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: "sch-doc-1", documentType: 1 }) },
+      sch_PrimitiveWire: {
+        get: vi.fn(async () => wire),
+        getAll: vi.fn(async () => [wire]),
+        modify: vi.fn(async (_id: string, patch: any) => {
+          setTimeout(
+            () =>
+              Object.assign(wire, {
+                line: patch.line ? [patch.line[2], patch.line[3], patch.line[0], patch.line[1]] : undefined,
+                net: patch.net ?? "",
+                color: patch.color ?? null,
+                lineWidth: patch.lineWidth ?? null,
+                lineType: patch.lineType ?? null
+              }),
+            25
+          );
+        })
+      }
+    };
+    return { wire, eda, api: () => eda };
+  }
+  it("maps coordinates to native line, preserves other fields and waits for persistence without replay", async () => {
+    const f = fixture();
+    const p = await prepareSchematicWireMutation(f.api, {
+      action: "modifyWire",
+      wireId: "w1",
+      coordinates: [40, 0, 60, 0]
+    });
+    const record = extensionMutations.get(String(p.mutationId));
+    const result = await executeSchematicWireMutation(record, f.api);
+    expect(f.eda.sch_PrimitiveWire.modify).toHaveBeenCalledExactlyOnceWith("w1", {
+      line: [40, 0, 60, 0],
+      net: "GND",
+      color: "#123456",
+      lineWidth: 2,
+      lineType: 1
+    });
+    expect(result.readback.verified).toBe(true);
+    expect(f.wire.line).toEqual([60, 0, 40, 0]);
+  });
+  it("rejects stale baseline before replacement", async () => {
+    const f = fixture();
+    const p = await prepareSchematicWireMutation(f.api, { action: "modifyWire", wireId: "w1", net: "NEW" });
+    f.wire.color = "#abcdef";
+    await expect(executeSchematicWireMutation(extensionMutations.get(String(p.mutationId)), f.api)).rejects.toThrow(
+      /changed|stale/i
+    );
+    expect(f.eda.sch_PrimitiveWire.modify).not.toHaveBeenCalled();
+  });
 });

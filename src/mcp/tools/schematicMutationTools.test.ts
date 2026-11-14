@@ -60,7 +60,8 @@ describe("Schematic Mutation MCP Tools", () => {
         device: "C1523",
         x: 1000,
         y: 2000,
-        designator: "R1"
+        designator: "R1",
+        uniqueId: "stable-created-component"
       }
     });
 
@@ -72,7 +73,8 @@ describe("Schematic Mutation MCP Tools", () => {
         device: "C1523",
         x: 1000,
         y: 2000,
-        designator: "R1"
+        designator: "R1",
+        uniqueId: "stable-created-component"
       }),
       30_000
     );
@@ -379,7 +381,12 @@ describe("Schematic Mutation MCP Tools", () => {
     const result = await client.callTool({
       name: "easyeda_prepare_schematic_pcb_sync",
       arguments: {
-        action: "syncToPcb"
+        action: "syncToPcb",
+        projectId: "p",
+        boardName: "upper",
+        schematicUuid: "sch",
+        pcbUuid: "pcb",
+        protectedBoardName: "original"
       }
     });
 
@@ -396,4 +403,38 @@ describe("Schematic Mutation MCP Tools", () => {
       confirmation
     });
   });
+});
+
+it("rejects missing explicit sync identities before the bridge call", async () => {
+  const bridge: any = { call: vi.fn() };
+  const client = await makeClient(bridge);
+  const result = await client.callTool({
+    name: "easyeda_prepare_schematic_pcb_sync",
+    arguments: { action: "syncToPcb" }
+  });
+  expect(result.isError).toBe(true);
+  expect(bridge.call).not.toHaveBeenCalled();
+});
+
+it("exposes scoped read/reconcile tools as read-only and forwards exact identities", async () => {
+  const bridge: any = { call: vi.fn(async () => ({ verified: false })) };
+  const client = await makeClient(bridge);
+  const tools = await client.listTools();
+  for (const name of ["easyeda_get_schematic_pcb_sync_state", "easyeda_reconcile_schematic_pcb_sync"]) {
+    expect(tools.tools.find((t) => t.name === name)?.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false
+    });
+  }
+  const identities = {
+    projectId: "p",
+    boardName: "upper",
+    schematicUuid: "sch",
+    pcbUuid: "pcb",
+    protectedBoardName: "original"
+  };
+  await client.callTool({ name: "easyeda_get_schematic_pcb_sync_state", arguments: identities });
+  expect(bridge.call).toHaveBeenLastCalledWith("readScopedPcbSyncState", identities, 60000);
+  await client.callTool({ name: "easyeda_reconcile_schematic_pcb_sync", arguments: { mutationId: "receipt" } });
+  expect(bridge.call).toHaveBeenLastCalledWith("reconcileSchematicPcbSync", { mutationId: "receipt" }, 60000);
 });

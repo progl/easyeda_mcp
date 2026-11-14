@@ -25,13 +25,13 @@ export interface Component3dInfo {
   x: number;
   y: number;
   rotation: number;
-  has3DModel: boolean;
-  modelType: "STEP" | "OBJ" | "WRL" | "NONE";
+  has3DModel: boolean | null;
+  modelType: "STEP" | "OBJ" | "WRL" | "NONE" | "UNKNOWN";
   modelTitle?: string;
   modelUuid?: string;
-  heightMm: number;
-  elevationMm: number;
-  heightSource: "native_3d" | "attribute" | "package_heuristic";
+  heightMm: number | null;
+  elevationMm: number | null;
+  heightSource: "native_3d" | "attribute" | "package_heuristic" | "unknown";
   boundingBox3d: {
     minX: number;
     maxX: number;
@@ -39,30 +39,30 @@ export interface Component3dInfo {
     maxY: number;
     minZ: number;
     maxZ: number;
-  };
+  } | null;
 }
 
 export interface Board3dEnvelope {
-  boardThicknessMm: number;
-  maxHeightTopMm: number;
-  maxHeightBottomMm: number;
-  totalEnvelopeHeightMm: number;
+  boardThicknessMm: number | null;
+  maxHeightTopMm: number | null;
+  maxHeightBottomMm: number | null;
+  totalEnvelopeHeightMm: number | null;
   tallestComponentTop?: {
     designator: string;
-    heightMm: number;
+    heightMm: number | null;
     footprint: string;
     x: number;
     y: number;
   };
   tallestComponentBottom?: {
     designator: string;
-    heightMm: number;
+    heightMm: number | null;
     footprint: string;
     x: number;
     y: number;
   };
-  enclosureClearanceMm?: number;
-  enclosureStatus?: "FIT" | "TIGHT" | "EXCEEDED";
+  enclosureClearanceMm?: number | null;
+  enclosureStatus?: "FIT" | "TIGHT" | "EXCEEDED" | "UNKNOWN";
 }
 
 export interface Missing3dModel {
@@ -81,7 +81,7 @@ export interface InterferencePair3d {
 
 export interface HeightViolation3d {
   designator: string;
-  heightMm: number;
+  heightMm: number | null;
   maxPermittedMm: number;
   exceededByMm: number;
   layer: string;
@@ -214,296 +214,88 @@ export async function inspectPcb3d(
     throw apiError("wrong_document", "3D PCB inspection requires an active PCB document.");
   }
 
-  // Get raw components
-  let rawComponents: any[] = [];
-  if (eda.pcb_PrimitiveComponent?.getAll) {
-    rawComponents = toArray(await optionalCall(() => eda.pcb_PrimitiveComponent.getAll()));
-  }
-
-  // Default board thickness nominal 1.6mm or check stackup
-  let boardThicknessMm = 1.6;
-  if (eda.pcb_Layer?.getAllLayers) {
-    const layers = toArray(await optionalCall(() => eda.pcb_Layer.getAllLayers()));
-    const thicknessAttr = layers.find((l: any) => l.totalThickness || l.boardThickness) as
-      Record<string, any> | undefined;
-    if (thicknessAttr) {
-      boardThicknessMm = numeric(thicknessAttr.totalThickness ?? thicknessAttr.boardThickness) ?? 1.6;
-    }
-  }
-
-  const component3dList: Component3dInfo[] = [];
-  const missingModelsList: Missing3dModel[] = [];
-  const heightViolations: HeightViolation3d[] = [];
-
-  let maxHeightTopMm = 0;
-  let maxHeightBottomMm = 0;
-  let tallestTop: Component3dInfo | undefined;
-  let tallestBottom: Component3dInfo | undefined;
-
-  for (const comp of rawComponents) {
-    const primitiveId = String(getProp(comp, "getState_PrimitiveId", ["primitiveId", "id", "uuid"]) ?? "");
-    const designator = String(getProp(comp, "getState_Designator", ["designator", "name", "prefix"]) ?? "");
-    const footprint = String(getProp(comp, "getState_Footprint", ["footprint", "package", "packageName"]) ?? "");
-    const x = numeric(getProp(comp, "getState_X", ["x", "centerX"])) ?? 0;
-    const y = numeric(getProp(comp, "getState_Y", ["y", "centerY"])) ?? 0;
-    const rotation = numeric(getProp(comp, "getState_Rotation", ["rotation", "angle"])) ?? 0;
-    const rawLayer = getProp(comp, "getState_Layer", ["layer", "layerId"]) ?? 1;
-
-    const layerNum = Number(rawLayer);
-    const isBottom = layerNum === 2 || String(rawLayer).toLowerCase().includes("bottom");
-    const layerName: "Top" | "Bottom" | "Other" = isBottom
-      ? "Bottom"
-      : layerNum === 1 || String(rawLayer).toLowerCase().includes("top")
-        ? "Top"
-        : "Other";
-
-    // Inspect 3D model properties
-    const model3d = getProp(comp, "getState_3DModel", ["3dModel", "model3D", "model3d", "model"]);
-    let has3DModel = false;
-    let modelType: "STEP" | "OBJ" | "WRL" | "NONE" = "NONE";
-    let modelTitle: string | undefined;
-    let modelUuid: string | undefined;
-    let heightMm: number | undefined;
-    let elevationMm = 0;
-    let heightSource: "native_3d" | "attribute" | "package_heuristic" = "package_heuristic";
-
-    if (model3d && typeof model3d === "object") {
-      has3DModel = true;
-      modelTitle = model3d.title ?? model3d.name ?? model3d.modelName;
-      modelUuid = model3d.uuid ?? model3d.id;
-      const typeStr = String(model3d.type ?? model3d.format ?? "").toUpperCase();
-      if (typeStr.includes("STEP") || typeStr.includes("STP")) modelType = "STEP";
-      else if (typeStr.includes("OBJ")) modelType = "OBJ";
-      else if (typeStr.includes("WRL") || typeStr.includes("VRML")) modelType = "WRL";
-      else modelType = "STEP";
-
-      if (numeric(model3d.height) !== undefined) {
-        heightMm = numeric(model3d.height);
-        heightSource = "native_3d";
-      }
-      if (numeric(model3d.z ?? model3d.elevation ?? model3d.zOffset) !== undefined) {
-        elevationMm = numeric(model3d.z ?? model3d.elevation ?? model3d.zOffset)!;
-      }
-    }
-
-    // Check custom attributes
-    if (heightMm === undefined) {
-      const attrs = getProp(comp, "getState_Attributes", ["attributes", "properties", "customProperties"]);
-      if (attrs && typeof attrs === "object") {
-        const hVal = attrs["Height"] ?? attrs["HEIGHT"] ?? attrs["PackageHeight"] ?? attrs["Thickness"];
-        if (numeric(hVal) !== undefined) {
-          heightMm = numeric(hVal);
-          heightSource = "attribute";
-        }
-      }
-    }
-
-    // Fallback heuristic
-    if (heightMm === undefined) {
-      heightMm = estimateComponentHeight(footprint, designator);
-      heightSource = "package_heuristic";
-    }
-
-    // Dimensions for 3D bounding box
-    const width =
-      numeric(getProp(comp, "getState_Width", ["width", "w"])) ??
-      (footprint.includes("0805") ? 1.25 : footprint.includes("0603") ? 0.8 : 5.0);
-    const length =
-      numeric(getProp(comp, "getState_Length", ["length", "l", "height"])) ??
-      (footprint.includes("0805") ? 2.0 : footprint.includes("0603") ? 1.6 : 5.0);
-
-    const minX = Math.round((x - width / 2) * 100) / 100;
-    const maxX = Math.round((x + width / 2) * 100) / 100;
-    const minY = Math.round((y - length / 2) * 100) / 100;
-    const maxY = Math.round((y + length / 2) * 100) / 100;
-
-    let minZ: number;
-    let maxZ: number;
-
-    if (isBottom) {
-      // Bottom layer: hangs downwards below the PCB bottom plane (-boardThicknessMm)
-      maxZ = -boardThicknessMm - elevationMm;
-      minZ = maxZ - heightMm;
-      if (heightMm > maxHeightBottomMm) {
-        maxHeightBottomMm = heightMm;
-        tallestBottom = {
-          primitiveId,
-          designator,
-          footprint,
-          layer: rawLayer,
-          layerName,
-          x,
-          y,
-          rotation,
-          has3DModel,
-          modelType,
-          modelTitle,
-          modelUuid,
-          heightMm,
-          elevationMm,
-          heightSource,
-          boundingBox3d: { minX, maxX, minY, maxY, minZ, maxZ }
-        };
-      }
-    } else {
-      // Top layer: extends upwards above 0 (top copper plane)
-      minZ = elevationMm;
-      maxZ = elevationMm + heightMm;
-      if (heightMm > maxHeightTopMm) {
-        maxHeightTopMm = heightMm;
-        tallestTop = {
-          primitiveId,
-          designator,
-          footprint,
-          layer: rawLayer,
-          layerName,
-          x,
-          y,
-          rotation,
-          has3DModel,
-          modelType,
-          modelTitle,
-          modelUuid,
-          heightMm,
-          elevationMm,
-          heightSource,
-          boundingBox3d: { minX, maxX, minY, maxY, minZ, maxZ }
-        };
-      }
-    }
-
-    const compInfo: Component3dInfo = {
+  const rawComponents = toArray(await optionalCall(() => eda.pcb_PrimitiveComponent?.getAll?.()));
+  const components = rawComponents.map((comp: any) => {
+    const primitiveId = String(getProp(comp, "getState_PrimitiveId", ["primitiveId", "id"]) ?? "");
+    const designator = String(getProp(comp, "getState_Designator", ["designator", "name"]) ?? "");
+    const rawFootprint = getProp(comp, "getState_Footprint", ["footprint", "package", "packageName"]);
+    const label = typeof rawFootprint === "string" ? rawFootprint : (rawFootprint?.name ?? rawFootprint?.title);
+    const footprint = typeof label === "string" ? label : "";
+    const model = getProp(comp, "getState_3DModel", ["3dModel", "model3D", "model3d", "model"]);
+    const modelUuid = typeof model?.uuid === "string" ? model.uuid : undefined;
+    const modelTitle = typeof model?.title === "string" ? model.title : undefined;
+    const metadataHeight = numeric(model?.height);
+    return {
       primitiveId,
       designator,
       footprint,
-      layer: rawLayer,
-      layerName,
-      x,
-      y,
-      rotation,
-      has3DModel,
-      modelType,
-      modelTitle,
+      footprintUuid: typeof rawFootprint?.uuid === "string" ? rawFootprint.uuid : undefined,
+      x: numeric(getProp(comp, "getState_X", ["x", "centerX"])),
+      y: numeric(getProp(comp, "getState_Y", ["y", "centerY"])),
+      coordinateUnits: "mil",
+      rotation: numeric(getProp(comp, "getState_Rotation", ["rotation", "angle"])),
+      layer: getProp(comp, "getState_Layer", ["layer", "layerId"]),
+      modelReferencePresent: Boolean(modelUuid || modelTitle),
       modelUuid,
-      heightMm: Math.round(heightMm * 100) / 100,
-      elevationMm: Math.round(elevationMm * 100) / 100,
-      heightSource,
-      boundingBox3d: {
-        minX,
-        maxX,
-        minY,
-        maxY,
-        minZ: Math.round(minZ * 100) / 100,
-        maxZ: Math.round(maxZ * 100) / 100
+      modelTitle,
+      // A binding/UUID, metadata height or render capability does not establish
+      // a loaded solid, its transform, units, shape or actual bounding box.
+      has3DModel: null,
+      modelType: "UNKNOWN",
+      heightMm: null,
+      heightSource: "unknown",
+      elevationMm: null,
+      boundingBox3d: null,
+      nativeGeometryVerified: false,
+      reportedModelHeightMm: metadataHeight !== undefined && metadataHeight > 0 ? metadataHeight : undefined,
+      heuristic: {
+        heightEstimateMm: estimateComponentHeight(footprint, designator),
+        source: "package_heuristic",
+        verified: false,
+        usableForEnclosureFit: false
       }
     };
-
-    component3dList.push(compInfo);
-
-    if (!has3DModel) {
-      missingModelsList.push({
-        designator,
-        footprint,
-        criticality: classifyMissingModelCriticality(designator, footprint),
-        reason: "No STEP or OBJ 3D model assigned to footprint."
-      });
-    }
-
-    if (params.maxHeightMm !== undefined && heightMm > params.maxHeightMm) {
-      heightViolations.push({
-        designator,
-        heightMm,
-        maxPermittedMm: params.maxHeightMm,
-        exceededByMm: Math.round((heightMm - params.maxHeightMm) * 100) / 100,
-        layer: layerName
-      });
-    }
-  }
-
-  // 3D Interference detection between components
-  const interferencePairs: InterferencePair3d[] = [];
-  if (params.checkInterference !== false && component3dList.length > 1) {
-    for (let i = 0; i < component3dList.length; i++) {
-      const a = component3dList[i];
-      for (let j = i + 1; j < component3dList.length; j++) {
-        const b = component3dList[j];
-        if (a.layerName !== b.layerName) continue; // Different sides don't collide
-
-        const xOverlap = a.boundingBox3d.minX < b.boundingBox3d.maxX && a.boundingBox3d.maxX > b.boundingBox3d.minX;
-        const yOverlap = a.boundingBox3d.minY < b.boundingBox3d.maxY && a.boundingBox3d.maxY > b.boundingBox3d.minY;
-        const zOverlap = a.boundingBox3d.minZ < b.boundingBox3d.maxZ && a.boundingBox3d.maxZ > b.boundingBox3d.minZ;
-
-        if (xOverlap && yOverlap && zOverlap) {
-          const overlapW =
-            Math.min(a.boundingBox3d.maxX, b.boundingBox3d.maxX) - Math.max(a.boundingBox3d.minX, b.boundingBox3d.minX);
-          const overlapL =
-            Math.min(a.boundingBox3d.maxY, b.boundingBox3d.maxY) - Math.max(a.boundingBox3d.minY, b.boundingBox3d.minY);
-          const overlapH =
-            Math.min(a.boundingBox3d.maxZ, b.boundingBox3d.maxZ) - Math.max(a.boundingBox3d.minZ, b.boundingBox3d.minZ);
-          const vol = Math.round(overlapW * overlapL * overlapH * 100) / 100;
-
-          interferencePairs.push({
-            componentA: a.designator,
-            componentB: b.designator,
-            overlapVolumeMm3: vol > 0 ? vol : undefined,
-            details: `3D bounding boxes collide on ${a.layerName} layer (overlap: ${overlapW.toFixed(2)}x${overlapL.toFixed(2)}x${overlapH.toFixed(2)} mm).`
-          });
-        }
-      }
-    }
-  }
-
-  const totalEnvelopeHeightMm = Math.round((boardThicknessMm + maxHeightTopMm + maxHeightBottomMm) * 100) / 100;
-
-  const envelope: Board3dEnvelope = {
-    boardThicknessMm,
-    maxHeightTopMm: Math.round(maxHeightTopMm * 100) / 100,
-    maxHeightBottomMm: Math.round(maxHeightBottomMm * 100) / 100,
-    totalEnvelopeHeightMm,
-    tallestComponentTop: tallestTop
-      ? {
-          designator: tallestTop.designator,
-          heightMm: tallestTop.heightMm,
-          footprint: tallestTop.footprint,
-          x: tallestTop.x,
-          y: tallestTop.y
-        }
-      : undefined,
-    tallestComponentBottom: tallestBottom
-      ? {
-          designator: tallestBottom.designator,
-          heightMm: tallestBottom.heightMm,
-          footprint: tallestBottom.footprint,
-          x: tallestBottom.x,
-          y: tallestBottom.y
-        }
-      : undefined
-  };
-
-  if (params.enclosureHeightMm !== undefined) {
-    envelope.enclosureClearanceMm = Math.round((params.enclosureHeightMm - totalEnvelopeHeightMm) * 100) / 100;
-    envelope.enclosureStatus =
-      envelope.enclosureClearanceMm < 0 ? "EXCEEDED" : envelope.enclosureClearanceMm < 1.0 ? "TIGHT" : "FIT";
-  }
-
-  // Detect native 3D API availability
-  const native3dAvailable = Boolean(
-    (eda.pcb_Document as any)?.get3DView ||
-    (eda.pcb_Document as any)?.export3D ||
-    (eda.dmt_EditorControl as any)?.get3DCanvas
+  });
+  assertDocumentTargetMatch(
+    currentTarget,
+    extractDocumentIdentity(await eda.dmt_SelectControl?.getCurrentDocumentInfo?.())
   );
-
+  const native3dAvailable = Boolean(
+    eda.pcb_Document?.get3DView || eda.pcb_Document?.export3D || eda.dmt_EditorControl?.get3DCanvas
+  );
   return {
     target: currentTarget,
-    envelope,
-    totalComponents: component3dList.length,
-    componentsWith3dModel: component3dList.filter((c) => c.has3DModel).length,
-    componentsMissing3dModel: missingModelsList.length,
-    missing3dModels: missingModelsList,
-    interferenceCollisions: interferencePairs,
-    heightViolations,
     native3dAvailable,
-    components: component3dList
+    nativeGeometryVerified: false,
+    envelope: {
+      boardThicknessMm: null,
+      maxHeightTopMm: null,
+      maxHeightBottomMm: null,
+      totalEnvelopeHeightMm: null,
+      enclosureClearanceMm: null,
+      enclosureStatus: "UNKNOWN"
+    },
+    totalComponents: components.length,
+    componentsWith3dModel: null,
+    componentsMissing3dModel: null,
+    modelReferenceCount: components.filter((c) => c.modelReferencePresent).length,
+    missing3dModels: components
+      .filter((c) => !c.modelReferencePresent)
+      .map((c) => ({
+        designator: c.designator,
+        footprint: c.footprint,
+        criticality: classifyMissingModelCriticality(c.designator, c.footprint),
+        reason: "No model reference reported; native solid availability has not been checked."
+      })),
+    interferenceStatus: params.checkInterference === false ? "NOT_REQUESTED" : "UNKNOWN",
+    interferenceCollisions: [],
+    heightViolations: [],
+    heightCheckStatus: "UNKNOWN",
+    limitations: [
+      "Native solids and transforms were not obtained. Empty collision/violation lists do not mean checked or clear.",
+      "Package estimates and model metadata are separate hints; enclosure fit and real component height remain unknown."
+    ],
+    components
   };
 }
 

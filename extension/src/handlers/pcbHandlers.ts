@@ -1,3 +1,7 @@
+import { fetchRoutingSummary } from "../mutation/pcbRoutingMutations.js";
+import { preparePcbAnnotationMutation } from "../mutation/pcbAnnotationMutations.js";
+import { getComponentPads, normalizePcbPad } from "../pcbGeometry.js";
+export { normalizePcbPad } from "../pcbGeometry.js";
 import {
   apiError,
   ensureApi,
@@ -32,6 +36,7 @@ import { inspectPcb3d, fetchPcb3dView } from "../reporting/pcb3dInspection.js";
 import type { EasyEdaApi, RpcHandler } from "../types.js";
 import {
   filterAndLimitViolations,
+  flattenNativeDrcGroups,
   normalizeDrcViolation,
   summarizeDrcViolations,
   type EditorDrcComparison
@@ -53,86 +58,6 @@ function getProp(obj: any, getterName: string, propNames: string[]): any {
     }
   }
   return undefined;
-}
-
-export function normalizePcbPad(pad: any, parentComp?: any, includeRaw = false): Record<string, unknown> {
-  const primitiveId = String(getProp(pad, "getState_PrimitiveId", ["primitiveId", "id", "uuid"]) ?? "");
-  const padNumber = getProp(pad, "getState_PadNumber", ["padNumber", "number", "name", "pinNumber"]);
-  const net = getProp(pad, "getState_Net", ["net", "netName"]);
-  const x = numeric(getProp(pad, "getState_X", ["x", "centerX"]));
-  const y = numeric(getProp(pad, "getState_Y", ["y", "centerY"]));
-  const layer = getProp(pad, "getState_Layer", ["layer", "layerId"]);
-  const width = numeric(getProp(pad, "getState_Width", ["width"]));
-  const height = numeric(getProp(pad, "getState_Height", ["height"]));
-  const holeDiameter = numeric(getProp(pad, "getState_HoleDiameter", ["holeDiameter", "hole", "diameter"]));
-  const shape = getProp(pad, "getState_Shape", ["shape", "padShape"]);
-  const rotation = numeric(getProp(pad, "getState_Rotation", ["rotation", "angle"])) ?? 0;
-  const locked = Boolean(getProp(pad, "getState_PrimitiveLock", ["locked", "primitiveLock"]));
-
-  const layerStr = String(layer ?? "").toLowerCase();
-  const isThroughHole =
-    (holeDiameter !== undefined && holeDiameter > 0) ||
-    layerStr.includes("multi") ||
-    layer === 11 ||
-    layer === "MultiLayer";
-
-  let side: "top" | "bottom" | "multi" | "unknown" = "unknown";
-  if (isThroughHole) {
-    side = "multi";
-  } else if (layerStr.includes("top") || layer === 1 || layer === "TopLayer") {
-    side = "top";
-  } else if (layerStr.includes("bot") || layer === 2 || layer === "BottomLayer") {
-    side = "bottom";
-  }
-
-  const compDesignator = parentComp
-    ? getProp(parentComp, "getState_Designator", ["designator", "name", "displayName"])
-    : undefined;
-  const compId = parentComp
-    ? getProp(parentComp, "getState_PrimitiveId", ["primitiveId", "id", "uuid"])
-    : getProp(pad, "getState_ParentComponentPrimitiveId", ["parentComponentPrimitiveId", "componentId"]);
-
-  return {
-    primitiveId: primitiveId || undefined,
-    padNumber: padNumber ? String(padNumber) : undefined,
-    net: net ? String(net) : undefined,
-    x,
-    y,
-    layer,
-    side,
-    shape: shape ? String(shape) : undefined,
-    width,
-    height,
-    holeDiameter,
-    rotation,
-    isThroughHole,
-    componentDesignator: compDesignator ? String(compDesignator) : undefined,
-    componentPrimitiveId: compId ? String(compId) : undefined,
-    locked,
-    ...(includeRaw ? { raw: sanitize(pad) } : {})
-  };
-}
-
-async function getComponentPads(comp: any, api: () => EasyEdaApi): Promise<unknown[]> {
-  if (typeof comp.getAllPins === "function") {
-    try {
-      const pins = await comp.getAllPins();
-      if (Array.isArray(pins)) return pins;
-    } catch {
-      // fallback
-    }
-  }
-  const eda = api();
-  const compId = getProp(comp, "getState_PrimitiveId", ["primitiveId", "id", "uuid"]);
-  if (compId && eda.pcb_PrimitiveComponent?.getAllPinsByPrimitiveId) {
-    try {
-      const pins = await eda.pcb_PrimitiveComponent.getAllPinsByPrimitiveId(compId);
-      if (Array.isArray(pins)) return pins;
-    } catch {
-      // fallback
-    }
-  }
-  return toArray(comp.pins ?? comp.pads ?? []);
 }
 
 export async function getPcbComponents(api: () => EasyEdaApi): Promise<unknown[]> {
@@ -184,11 +109,40 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
     const startedAt = Date.now();
     let rawResult: unknown;
     try {
-      rawResult = await eda.pcb_Drc.check(strict);
+      rawResult = await eda.pcb_Drc.check(strict, false, true);
     } catch (err) {
       throw apiError("drc_failed", `Native PCB DRC check failed: ${(err as Error)?.message || String(err)}`);
     }
+    let booleanControl: unknown;
+    let controlError: string | undefined;
+    if (Array.isArray(rawResult) && flattenNativeDrcGroups(rawResult).length === 0) {
+      try {
+        assertDocumentTargetMatch(
+          currentTarget,
+          extractDocumentIdentity(await eda.dmt_SelectControl?.getCurrentDocumentInfo?.())
+        );
+        booleanControl = await eda.pcb_Drc.check(strict, false, false);
+      } catch (error) {
+        controlError = String(error);
+      }
+    }
+    assertDocumentTargetMatch(
+      currentTarget,
+      extractDocumentIdentity(await eda.dmt_SelectControl?.getCurrentDocumentInfo?.())
+    );
     const durationMs = Date.now() - startedAt;
+    const detailsAvailable = Array.isArray(rawResult);
+    const nativeEvidence = {
+      verboseRequested: true,
+      detailsAvailable,
+      legacyBooleanResult: typeof rawResult === "boolean" ? rawResult : undefined,
+      booleanControl,
+      controlError,
+      detailsUnavailable:
+        !detailsAvailable ||
+        (flattenNativeDrcGroups(Array.isArray(rawResult) ? rawResult : []).length === 0 && booleanControl !== true),
+      note: "Native verbose groups omit failedItems; empty details require a successful boolean control. Boolean failure does not identify a violation count."
+    };
 
     let rawViolations: unknown[] = [];
     let passed = true;
@@ -196,8 +150,8 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
     let nativeReportedWarnings = 0;
 
     if (Array.isArray(rawResult)) {
-      rawViolations = rawResult;
-      passed = rawResult.length === 0;
+      rawViolations = flattenNativeDrcGroups(rawResult);
+      passed = rawViolations.length === 0 && booleanControl === true;
     } else if (rawResult && typeof rawResult === "object") {
       const rawObj = rawResult as Record<string, any>;
       if (Array.isArray(rawObj.errors)) {
@@ -220,15 +174,8 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
         passed = nativeReportedErrors === 0;
       }
     } else if (typeof rawResult === "boolean") {
-      passed = rawResult;
-      nativeReportedErrors = rawResult ? 0 : 1;
-      if (!passed) {
-        rawViolations.push({
-          message: "Native PCB DRC check failed without detailed violation records.",
-          severity: "error",
-          rule: "General"
-        });
-      }
+      // A legacy boolean supplies no violation records or reliable count.
+      passed = false;
     }
 
     const normalizedViolations = rawViolations.map((v, i) => normalizeDrcViolation(v, i));
@@ -236,7 +183,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
 
     const totalErrors = Math.max(summary.errors, nativeReportedErrors);
     const totalWarnings = Math.max(summary.warnings, nativeReportedWarnings);
-    if (totalErrors > 0) {
+    if (totalErrors > 0 || nativeEvidence.detailsUnavailable) {
       passed = false;
     }
 
@@ -303,7 +250,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
     return {
       executionId,
       executedAt,
-      status: passed ? "passed" : "violations_found",
+      status: nativeEvidence.detailsUnavailable ? "inconclusive" : passed ? "passed" : "violations_found",
       passed,
       violationsCount: normalizedViolations.length,
       errorsCount: totalErrors,
@@ -318,6 +265,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
       durationMs,
       strict,
       warnings: filterWarnings,
+      nativeEvidence,
       rawResult: sanitize(rawResult)
     };
   }
@@ -358,70 +306,17 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
   }
 
   async function getRoutingStatus(params: Record<string, any>): Promise<Record<string, unknown>> {
-    const eda = api();
-    const netNames = await getPcbNetNames(api);
-    const names = netNames.map((n) => String(n)).filter(Boolean);
-    const includeLengths = Boolean(params.includeNetLengths);
+    const summary = await fetchRoutingSummary(api, params.target);
+    if (params.target) assertDocumentTargetMatch(params.target, summary.target);
     let netLengths: Record<string, number> | undefined;
-
-    if (includeLengths && eda.pcb_Net?.getNetLength) {
+    if (params.includeNetLengths && typeof api().pcb_Net?.getNetLength === "function") {
       netLengths = {};
-      for (const name of names) {
-        const len = await optionalCall(() => eda.pcb_Net.getNetLength(name));
-        if (typeof len === "number") {
-          netLengths[name] = len;
-        }
+      for (const name of summary.netNames) {
+        const length = await optionalCall(() => api().pcb_Net.getNetLength(name));
+        if (typeof length === "number" && Number.isFinite(length)) netLengths[name] = length;
       }
     }
-
-    let allNetsDetails: any[] = [];
-    if (eda.pcb_Net?.getAllNets) {
-      allNetsDetails = toArray(await optionalCall(() => eda.pcb_Net.getAllNets()));
-    }
-
-    const unroutedNetNames: string[] = [];
-    let routedCount = 0;
-
-    if (allNetsDetails.length > 0) {
-      for (const net of allNetsDetails) {
-        const name = String(net.name ?? net.netName ?? "");
-        const isRouted = Boolean(
-          net.isRouted === true ||
-          (net.unroutedCount === 0 && (net.trackCount > 0 || net.routedCount > 0)) ||
-          (netLengths && (netLengths[name] ?? 0) > 0)
-        );
-        if (isRouted) {
-          routedCount++;
-        } else if (name) {
-          unroutedNetNames.push(name);
-        }
-      }
-    } else if (netLengths) {
-      for (const [name, len] of Object.entries(netLengths)) {
-        if (len > 0) {
-          routedCount++;
-        } else {
-          unroutedNetNames.push(name);
-        }
-      }
-    } else {
-      routedCount = names.length;
-    }
-
-    const totalNets = names.length;
-    const completionPercent = totalNets > 0 ? Math.round((routedCount / totalNets) * 1000) / 10 : 100;
-
-    const documentInfo = await optionalCall(() => eda.dmt_SelectControl?.getCurrentDocumentInfo?.());
-    return {
-      target: extractDocumentIdentity(documentInfo),
-      totalNets,
-      routedNets: routedCount,
-      unroutedNets: Math.max(0, totalNets - routedCount),
-      completionPercent,
-      unroutedNetNames: sanitize(unroutedNetNames),
-      netNames: sanitize(names),
-      ...(netLengths ? { netLengths } : {})
-    };
+    return { ...summary, ...(netLengths ? { netLengths } : {}) };
   }
 
   async function listPcbComponents(params: Record<string, any>): Promise<Record<string, unknown>> {
@@ -519,6 +414,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
       count: items.length,
       layerFilter,
       components: items,
+      units: "mil",
       betaApi: true
     };
   }
@@ -594,6 +490,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
       totalPads: pads.length,
       count: items.length,
       pads: items,
+      units: "mil",
       componentFilter: params.component,
       netFilter: params.net,
       layerFilter,
@@ -658,6 +555,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
 
     return {
       target: currentTarget,
+      units: "mil",
       totalTracks: total,
       count,
       tracks
@@ -690,6 +588,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
 
     return {
       target: currentTarget,
+      units: "mil",
       totalVias: total,
       count,
       vias
@@ -861,6 +760,7 @@ export function createPcbHandlers(api: () => EasyEdaApi): Record<string, RpcHand
     getBoardOutline,
     getPcbTracks,
     getPcbVias,
+    preparePcbAnnotation: (params: Record<string, any>) => preparePcbAnnotationMutation(api, params),
     preparePcbTrackVia: (params: Record<string, any>) => preparePcbTrackViaMutation(api, params),
     getCopperZones,
     getKeepouts,

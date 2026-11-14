@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   parseSpecctraSes,
   parseEasyEdaRouterJson,
@@ -278,15 +278,16 @@ describe("pcbExternalImportMutations", () => {
             totalTracks++;
             return `trk-${totalTracks}`;
           },
-          getAll: async () => Array.from({ length: totalTracks }, (_, i) => ({ primitiveId: `trk-${i}` }))
+          getAll: async () => createdTracks.map((t, i) => ({ ...t, primitiveId: `trk-${i + 1}` }))
         },
         pcb_PrimitiveVia: {
-          create: async (v: any) => {
+          create: async (net: any, x: any, y: any, holeDiameter: any, diameter: any) => {
+            const v = { net, x, y, holeDiameter, diameter };
             createdVias.push(v);
             totalVias++;
             return `via-${totalVias}`;
           },
-          getAll: async () => Array.from({ length: totalVias }, (_, i) => ({ primitiveId: `via-${i}` }))
+          getAll: async () => createdVias.map((v, i) => ({ ...v, primitiveId: `via-${i + 1}` }))
         }
       });
 
@@ -307,7 +308,7 @@ describe("pcbExternalImportMutations", () => {
       expect(createdVias[0].net).toBe("GND");
     });
 
-    it("throws readback_incomplete if created primitives are not reflected in readback", async () => {
+    it("reports unknown if created primitives are not reflected in readback", async () => {
       const api = () => ({
         pcb_PrimitiveTrack: {
           create: async () => undefined, // silent fail without returned id
@@ -326,7 +327,7 @@ describe("pcbExternalImportMutations", () => {
           { action: "import_external", parsedData: parsed },
           { totalTracks: 0, totalVias: 0 }
         )
-      ).rejects.toThrow("Readback verification failed");
+      ).rejects.toMatchObject({ code: "write_readback_unknown" });
     });
 
     it("throws api_unavailable if track create method is not available", async () => {
@@ -335,7 +336,158 @@ describe("pcbExternalImportMutations", () => {
 
       await expect(
         executePcbExternalImportMutation(api, { action: "import_external", parsedData: parsed })
-      ).rejects.toThrow("PCB track creation API (pcb_PrimitiveTrack.create) is unavailable.");
+      ).rejects.toThrow(/pcb_Primitive(?:Track|Line).*unavailable/i);
     });
   });
+});
+
+it("uses the correct SDK id/patch placement signature and serial getter persistence for a layout import", async () => {
+  const states: any = [
+    {
+      primitiveId: "u1",
+      designator: "U1",
+      footprint: { uuid: "fp1" },
+      uniqueId: "uid1",
+      x: 0,
+      y: 0,
+      rotation: 0,
+      layer: 1
+    },
+    {
+      primitiveId: "c1",
+      designator: "C1",
+      footprint: { uuid: "fp2" },
+      uniqueId: "uid2",
+      x: 100,
+      y: 0,
+      rotation: 0,
+      layer: 1
+    }
+  ];
+  let busy = false,
+    dropped = 0;
+  const modify = vi.fn(async (id: string, patch: any) => {
+    if (busy) {
+      dropped++;
+      return;
+    }
+    busy = true;
+    setTimeout(() => {
+      Object.assign(
+        states.find((s: any) => s.primitiveId === id),
+        patch
+      );
+      busy = false;
+    }, 20);
+    return { primitiveId: id, ...patch };
+  });
+  const api = () => ({
+    dmt_SelectControl: {
+      getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "p", documentType: 3 })
+    },
+    pcb_PrimitiveComponent: {
+      getAll: async () => states,
+      get: async (id: string) => ({ ...states.find((s: any) => s.primitiveId === id) }),
+      getAllPinsByPrimitiveId: async (id: string) => [{ primitiveId: id + "-pad", padNumber: "1", net: "GND" }],
+      modify
+    }
+  });
+  const result = await executePcbExternalImportMutation(api, { parsedData: parseEasyEdaLayoutJson(sampleLayoutJson) });
+  expect(result.readback).toMatchObject({
+    verified: true,
+    modifiedComponentsCount: 2,
+    placementReadback: { padNetlinksPreserved: true, confirmedCount: 2 }
+  });
+  expect(dropped).toBe(0);
+  expect(modify).toHaveBeenCalledTimes(2);
+  expect(modify).toHaveBeenNthCalledWith(1, "u1", { x: 25.4, y: 30, rotation: 90, layer: 1 });
+  expect(modify).toHaveBeenNthCalledWith(2, "c1", { x: 15, y: 30, rotation: 0, layer: 1 });
+});
+
+it("a late initial layout lookup cannot start placements after the 40s execution budget", async () => {
+  vi.useFakeTimers();
+  let resolve!: (value: any) => void;
+  const modify = vi.fn();
+  try {
+    const api = () => ({
+      dmt_SelectControl: {
+        getCurrentDocumentInfo: async () => ({ uuid: "pcb", parentProjectUuid: "p", documentType: 3 })
+      },
+      pcb_PrimitiveComponent: {
+        getAll: () =>
+          new Promise((r) => {
+            resolve = r;
+          }),
+        modify
+      }
+    });
+    const result = executePcbExternalImportMutation(api, { parsedData: parseEasyEdaLayoutJson(sampleLayoutJson) });
+    const rejected = expect(result).rejects.toThrow(/deadline|timed out/i);
+    await vi.advanceTimersByTimeAsync(40001);
+    await rejected;
+    resolve([]);
+    await Promise.resolve();
+    expect(modify).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+it.each([false, true])("imports explicit metric routing beyond500 with native merge=%s", async (merged) => {
+  const lines: any[] = Array.from({ length: 679 }, (_, i) => ({
+      primitiveId: `old-track${i}`,
+      net: "OLD",
+      layer: 1,
+      startX: i,
+      startY: 900,
+      endX: i + 1,
+      endY: 900,
+      lineWidth: 10
+    })),
+    vias: any[] = Array.from({ length: 679 }, (_, i) => ({
+      primitiveId: `old-via${i}`,
+      net: "OLD",
+      x: i,
+      y: 900,
+      holeDiameter: 12,
+      diameter: 24
+    }));
+  const lineCreate = vi.fn(async (net, layer, startX, startY, endX, endY, lineWidth) => {
+    const p = { primitiveId: `t${lines.length}`, net, layer, startX, startY, endX, endY, lineWidth };
+    lines.push(p);
+    return merged ? { primitiveId: "retired-by-native-merge" } : p;
+  });
+  const viaCreate = vi.fn(async (net, x, y, holeDiameter, diameter) => {
+    const p = { primitiveId: "v0", net, x, y, holeDiameter, diameter };
+    vias.push(p);
+    return p;
+  });
+  const api = () => ({
+    pcb_PrimitiveLine: { create: lineCreate, getAll: async () => lines },
+    pcb_PrimitiveVia: { create: viaCreate, getAll: async () => vias }
+  });
+  const parsed = parseEasyEdaRouterJson({
+    units: "mm",
+    tracks: [
+      {
+        net: "PUMP_OUT",
+        layer: 1,
+        width: 1.27,
+        points: [
+          { x: 25.4, y: 12.7 },
+          { x: 50.8, y: 12.7 }
+        ]
+      }
+    ],
+    vias: [{ net: "PUMP_OUT", x: 50.8, y: 12.7, hole: 0.3048, diameter: 0.6096 }]
+  });
+  const result = await executePcbExternalImportMutation(api, { parsedData: parsed });
+  expect(lineCreate).toHaveBeenCalledExactlyOnceWith("PUMP_OUT", 1, 1000, 500, 2000, 500, 50);
+  expect(viaCreate).toHaveBeenCalledExactlyOnceWith(
+    "PUMP_OUT",
+    2000,
+    500,
+    expect.closeTo(12, 8),
+    expect.closeTo(24, 8)
+  );
+  expect(result.readback.verified).toBe(true);
 });

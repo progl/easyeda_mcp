@@ -1,3 +1,4 @@
+import { exportLibraryFile as exportLibraryFileNative } from "../reporting/libraryFileExport.js";
 import { apiError, ensureApi, sanitize, timestamp, toArray } from "../helpers.js";
 import {
   fetchDeviceDetails,
@@ -72,11 +73,94 @@ export async function saveApiFile(
   const validation = validateExportContent(format, normalizedFile, fileName, destinationPath);
   const saveResult = await eda.sys_FileSystem.saveFile(normalizedFile, fileName);
   return {
-    saved: true,
+    saved:
+      saveResult === true || (saveResult && typeof saveResult === "object" && saveResult.success === true)
+        ? true
+        : saveResult === false || (saveResult && typeof saveResult === "object" && saveResult.success === false)
+          ? false
+          : null,
+    saveRequested: true,
     fileName,
     saveResult: sanitize(saveResult),
     betaApi,
     validation: sanitize(validation)
+  };
+}
+
+const GERBER_DATA_LIMIT = 20 * 1024 * 1024;
+
+// Checks actual ZIP framing/central directory bounds; does not decompress or verify member CRCs.
+function validateGerberZip(bytes: Uint8Array): number {
+  const invalid = () => apiError("invalid_export", "Gerber export is not a supported, structurally valid ZIP archive.");
+  if (bytes.length < 22) throw invalid();
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let end = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 65535); i--) {
+    if (view.getUint32(i, true) === 0x06054b50 && i + 22 + view.getUint16(i + 20, true) === bytes.length) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0 || view.getUint16(end + 4, true) !== 0 || view.getUint16(end + 6, true) !== 0) throw invalid();
+  const entries = view.getUint16(end + 10, true),
+    size = view.getUint32(end + 12, true),
+    offset = view.getUint32(end + 16, true);
+  if (entries === 65535 || view.getUint16(end + 8, true) !== entries || offset + size !== end) throw invalid();
+  let cursor = offset;
+  for (let n = 0; n < entries; n++) {
+    if (cursor + 46 > end || view.getUint32(cursor, true) !== 0x02014b50) throw invalid();
+    const localOffset = view.getUint32(cursor + 42, true);
+    if (localOffset + 30 > offset || view.getUint32(localOffset, true) !== 0x04034b50) throw invalid();
+    const dataOffset =
+      localOffset + 30 + view.getUint16(localOffset + 26, true) + view.getUint16(localOffset + 28, true);
+    if (dataOffset + view.getUint32(cursor + 20, true) > offset || view.getUint16(cursor + 34, true) !== 0)
+      throw invalid();
+    cursor +=
+      46 + view.getUint16(cursor + 28, true) + view.getUint16(cursor + 30, true) + view.getUint16(cursor + 32, true);
+  }
+  if (cursor !== end || (!entries && (offset !== 0 || size !== 0))) throw invalid();
+  return entries;
+}
+
+async function returnGerberData(file: unknown, fallbackFileName: string): Promise<Record<string, unknown>> {
+  const normalized = extractFile(file) as File | undefined;
+  if (!normalized || typeof normalized.arrayBuffer !== "function")
+    throw apiError("invalid_export", "Gerber data export requires a binary File/Blob.");
+  if (!Number.isSafeInteger(normalized.size) || normalized.size < 0 || normalized.size > GERBER_DATA_LIMIT)
+    throw apiError("export_too_large", "Gerber returnData limit is 20 MiB.");
+  const buffer = await normalized.arrayBuffer();
+  if (
+    !(buffer instanceof ArrayBuffer) ||
+    buffer.byteLength > GERBER_DATA_LIMIT ||
+    buffer.byteLength !== normalized.size
+  )
+    throw apiError("invalid_export", "Gerber binary size mismatch or 20 MiB limit exceeded.");
+  const bytes = new Uint8Array(buffer),
+    entries = validateGerberZip(bytes);
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += 32768) chunks.push(String.fromCharCode(...bytes.subarray(i, i + 32768)));
+  return {
+    saved: false,
+    saveRequested: false,
+    returned: true,
+    fileName: normalized.name || fallbackFileName,
+    mimeType: "application/zip",
+    fileSizeBytes: bytes.length,
+    dataBase64: btoa(chunks.join("")),
+    betaApi: true,
+    validation: {
+      valid: true,
+      format: "zip",
+      fileSizeBytes: bytes.length,
+      entries,
+      checks: [
+        {
+          check: "zip_structure",
+          passed: true,
+          message: "ZIP headers and central directory bounds verified from bytes; member CRCs/content not checked."
+        }
+      ]
+    }
   };
 }
 
@@ -101,6 +185,7 @@ export function createExportHandlers(api: () => EasyEdaApi): Record<string, RpcH
     ensureApi("pcb_ManufactureData", "getGerberFile", eda);
     const fileName = params.fileName ?? `easyeda-gerber-${timestamp()}`;
     const file = await eda.pcb_ManufactureData.getGerberFile(fileName);
+    if (params.returnData === true) return returnGerberData(file, `${fileName}.zip`);
     return saveApiFile(api, file, `${fileName}.zip`, true, params.destinationPath, "zip");
   }
 
@@ -172,6 +257,7 @@ export function createExportHandlers(api: () => EasyEdaApi): Record<string, RpcH
   }
 
   return {
+    exportLibraryFile: (params: Record<string, any>) => exportLibraryFileNative(api, params),
     exportBom,
     exportNetlist,
     exportGerber,

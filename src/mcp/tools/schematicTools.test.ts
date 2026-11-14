@@ -16,6 +16,36 @@ async function makeClient(bridge: EditorClient) {
 }
 
 describe("schematicTools MCP registration and invocation", () => {
+  it("forwards the native netlist budget separately from the transport timeout", async () => {
+    const bridge = {
+      endpoint: "ws://127.0.0.1:8765",
+      getStatus: (): EditorStatus => ({ connected: true, updatedAt: new Date().toISOString() }),
+      call: vi.fn(async () => ({ nativeNetlist: { status: "available" } }))
+    };
+    const client = await makeClient(bridge);
+    const result = await client.callTool({
+      name: "easyeda_schematic_snapshot",
+      arguments: {
+        allPages: true,
+        nativeNetlistTimeoutMs: 15000,
+        timeoutMs: 60000
+      }
+    });
+    expect(result.isError).toBeFalsy();
+    expect(bridge.call).toHaveBeenCalledWith(
+      "schematicSnapshot",
+      expect.objectContaining({ nativeNetlistTimeoutMs: 15000 }),
+      60000
+    );
+    bridge.call.mockClear();
+    const invalid = await client.callTool({
+      name: "easyeda_schematic_snapshot",
+      arguments: { nativeNetlistTimeoutMs: 20001 }
+    });
+    expect(invalid.isError).toBe(true);
+    expect(bridge.call).not.toHaveBeenCalled();
+  });
+
   it("registers all schematic inspection, native nets, and ERC tools", () => {
     const server = new McpServer({ name: "test", version: "1.0.0" });
     const registerToolSpy = vi.spyOn(server, "registerTool");
@@ -29,6 +59,7 @@ describe("schematicTools MCP registration and invocation", () => {
 
     const registeredToolNames = registerToolSpy.mock.calls.map((call) => call[0]);
     expect(registeredToolNames).toEqual([
+      "easyeda_get_schematic_annotation_inventory",
       "easyeda_find_component",
       "easyeda_find_net",
       "easyeda_schematic_snapshot",
@@ -87,6 +118,23 @@ describe("schematicTools MCP registration and invocation", () => {
     });
   });
 
+  it.each([undefined, false, true])(
+    "forwards ERC showResults=%s through the existing RPC contract",
+    async (showResults) => {
+      const bridge = { call: vi.fn(async () => ({ errorsCount: 0, warningsCount: 5, detailsComplete: false })) };
+      const client = await makeClient(bridge);
+      const result = await client.callTool({
+        name: "easyeda_run_schematic_erc",
+        arguments: showResults === undefined ? {} : { showResults }
+      });
+      expect(result.isError).toBeFalsy();
+      expect(bridge.call).toHaveBeenCalledWith(
+        "runSchematicErc",
+        expect.objectContaining({ strict: true, showResults: showResults === true }),
+        60000
+      );
+    }
+  );
   it("invokes easyeda_run_schematic_erc and returns ERC violations", async () => {
     const bridge = {
       endpoint: "ws://127.0.0.1:8765",
@@ -204,4 +252,25 @@ describe("schematicTools MCP registration and invocation", () => {
       }
     });
   });
+});
+
+it("reads scoped free text/rectangle inventory without preparing an edit", async () => {
+  const bridge: any = {
+    call: vi.fn(async () => ({ readOnly: true, texts: [{ primitiveId: "t", content: "Heading" }], rectangles: [] }))
+  };
+  const client = await makeClient(bridge);
+  const args = {
+    target: { projectId: "p", documentId: "page", documentType: "schematic" },
+    expectedBoardName: "upper",
+    protectedBoardName: "Board1"
+  };
+  const listed = await client.listTools();
+  expect(listed.tools.find((t) => t.name === "easyeda_get_schematic_annotation_inventory")?.annotations).toMatchObject({
+    readOnlyHint: true,
+    destructiveHint: false
+  });
+  const result = await client.callTool({ name: "easyeda_get_schematic_annotation_inventory", arguments: args });
+  expect(result.isError).toBeFalsy();
+  expect(bridge.call).toHaveBeenCalledExactlyOnceWith("getSchematicAnnotationInventory", args, 30000);
+  await client.close();
 });

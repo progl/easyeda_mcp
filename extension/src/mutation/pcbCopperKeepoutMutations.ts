@@ -19,7 +19,10 @@ export interface NormalizedCopperZone {
   layer: string | number;
   clearance?: number;
   fillType?: string;
+  pourPriority?: number;
   isPoured?: boolean;
+  pouredVerified?: boolean;
+  fillEvidence?: NativePourFillEvidence;
   points: Array<{ x: number; y: number }>;
   vertexCount: number;
   bounds: {
@@ -34,10 +37,79 @@ export interface NormalizedCopperZone {
   raw?: Record<string, unknown>;
 }
 
+export type NativePourFillEvidence = {
+  status: "filled" | "absent" | "unknown";
+  pourPrimitiveId: string;
+  source: "pcb_PrimitivePoured.getAll" | "Pour.getCopperRegion" | "unavailable";
+  fillCount: number;
+  fillIds: string[];
+  geometrySourceVerified: boolean;
+  note?: string;
+};
+
+export async function readNativePourFillEvidence(eda: EasyEdaApi, pourId: string): Promise<NativePourFillEvidence> {
+  const evidence: NativePourFillEvidence = {
+    status: "unknown",
+    pourPrimitiveId: pourId,
+    source: "unavailable",
+    fillCount: 0,
+    fillIds: [],
+    geometrySourceVerified: false
+  };
+  try {
+    let list: any[];
+    if (typeof eda.pcb_PrimitivePoured?.getAll === "function") {
+      evidence.source = "pcb_PrimitivePoured.getAll";
+      const read = await eda.pcb_PrimitivePoured.getAll();
+      if (!Array.isArray(read)) return { ...evidence, note: "Native poured inventory was not an array." };
+      list = read;
+    } else {
+      const pour = await eda.pcb_PrimitivePour?.get?.(pourId);
+      if (typeof pour?.getCopperRegion !== "function") return evidence;
+      evidence.source = "Pour.getCopperRegion";
+      const read = await pour.getCopperRegion();
+      list = read ? [read] : [];
+    }
+    const owned = list.filter((p) => p?.getState_PourPrimitiveId?.() === pourId);
+    let malformed = false;
+    for (const p of owned) {
+      const fills = p.getState_PourFills?.();
+      if (!Array.isArray(fills)) {
+        malformed = true;
+        continue;
+      }
+      for (const fill of fills) {
+        const source = fill?.path?.getSource?.() ?? fill?.path?.getSourceStrictComplex?.();
+        // This proves presence of native owned fill geometry, not its clearances,
+        // net connectivity, topology, coordinate units or rebuild freshness.
+        if (!Array.isArray(source) || !source.length || !source.flat(Infinity).some(Number.isFinite)) {
+          malformed = true;
+          continue;
+        }
+        evidence.fillCount++;
+        if (typeof fill.id === "string" || typeof fill.id === "number") evidence.fillIds.push(String(fill.id));
+      }
+    }
+    if (evidence.fillCount && !malformed) {
+      evidence.status = "filled";
+      evidence.geometrySourceVerified = true;
+    } else if (!malformed) evidence.status = "absent";
+    else evidence.note = "Owned poured geometry could not be independently inspected.";
+    if (list.length && !owned.length && evidence.source === "Pour.getCopperRegion") {
+      evidence.status = "unknown";
+      evidence.note = "Native getter returned geometry owned by another pour.";
+    }
+    return evidence;
+  } catch (error) {
+    return { ...evidence, status: "unknown", note: String(error).slice(0, 300) };
+  }
+}
+
 export interface NormalizedKeepout {
   primitiveId: string;
   layer: string | number;
   keepoutType?: string;
+  ruleTypes?: number[];
   points: Array<{ x: number; y: number }>;
   vertexCount: number;
   bounds: {
@@ -61,6 +133,7 @@ export type PcbCopperKeepoutOperation =
       points: Array<{ x: number; y: number }>;
       clearance?: number;
       fillType?: string;
+      pourPriority?: number;
     }
   | {
       entity: "copperZone";
@@ -71,6 +144,7 @@ export type PcbCopperKeepoutOperation =
         layer?: string | number;
         clearance?: number;
         fillType?: string;
+        pourPriority?: number;
         points?: Array<{ x: number; y: number }>;
       };
     }
@@ -128,6 +202,59 @@ function getProp(obj: any, getterNames: string | string[], propNames: string[]):
   return undefined;
 }
 
+function validatePriority(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) <= 0)
+    throw apiError(
+      "unsupported_priority",
+      "pourPriority must be a positive integer native list position. Zero/highest is not independently verifiable due to the installed SDK zero-order getter bug."
+    );
+  return value as number;
+}
+function validateModifyProperties(entity: "copperZone" | "keepout", properties: Record<string, unknown>) {
+  const allowed =
+    entity === "copperZone"
+      ? ["net", "layer", "points", "clearance", "fillType", "pourPriority"]
+      : ["layer", "points", "keepoutType"];
+  const unknown = Object.keys(properties).filter((key) => !allowed.includes(key));
+  if (unknown.length)
+    throw apiError(
+      "unsupported_properties",
+      `Unknown ${entity} modify properties: ${unknown.join(", ")}. No write started.`
+    );
+  if (entity === "copperZone") validatePriority(properties.pourPriority);
+}
+function priorityReadback(requested: number | undefined, zone: NormalizedCopperZone, zones: NormalizedCopperZone[]) {
+  if (requested === undefined) return {};
+  if (!Number.isSafeInteger(zone.pourPriority) || zone.pourPriority! <= 0)
+    throw apiError(
+      "write_readback_unknown",
+      "Positive native pour priority assignment could not be independently read back; inspect before retrying."
+    );
+  return {
+    priorityReadback: {
+      requestedPosition: requested,
+      observedOrder: zone.pourPriority,
+      positiveAssignmentVerified: true,
+      exactRequestedNumberStored: zone.pourPriority === requested,
+      semantics:
+        "Native setOrder inserts after a clamped list position; smaller effective orders have higher precedence. The argument is not a stored scalar."
+    },
+    layerPriorityInventory: zones
+      .filter((z) => z.layer === zone.layer)
+      .sort((a, b) => (a.pourPriority ?? Infinity) - (b.pourPriority ?? Infinity))
+      .map((z) => ({
+        primitiveId: z.primitiveId,
+        net: z.net,
+        layer: z.layer,
+        observedOrder: z.pourPriority,
+        nativeZeroAliasPossible: z.primitiveId !== zone.primitiveId
+      })),
+    priorityNote:
+      "Only this explicitly positive assignment is verified here. Compare VM and GND after both receive positive assignments; untouched entries may still contain the native zero-order alias. Rebuild and inspect copper/DRC separately."
+  };
+}
+
 function parsePoints(rawPoints: unknown): Array<{ x: number; y: number }> {
   const arr = toArray(rawPoints);
   const result: Array<{ x: number; y: number }> = [];
@@ -164,6 +291,75 @@ function computeBounds(points: Array<{ x: number; y: number }>) {
   };
 }
 
+function nativePolygonPoints(raw: any): Array<{ x: number; y: number }> | undefined {
+  const polygon = raw.getState_ComplexPolygon?.();
+  if (!polygon) return undefined;
+  let source = polygon.getSource?.() ?? polygon.getSourceStrictComplex?.();
+  if (Array.isArray(source?.[0]) && source.length === 1) source = source[0];
+  if (!Array.isArray(source)) throw apiError("readback_failed", "Native area polygon source unavailable.");
+  let values: any[] = [];
+  if (typeof source[0] === "number") values = source.filter((v) => v !== "L");
+  else if (source[0] === "R" && !source[5] && !source[6]) {
+    const [, x, y, w, h] = source;
+    values = [x, y, x + w, y, x + w, y + h, x, y + h, x, y];
+  }
+  if (values.length < 6 || values.length % 2 || !values.every(Number.isFinite))
+    throw apiError("readback_failed", "Unsupported native area geometry; no verified polygon reported.");
+  const points = Array.from({ length: values.length / 2 }, (_, i) => ({
+    x: values[i * 2] * 0.0254,
+    y: values[i * 2 + 1] * 0.0254
+  }));
+  if (points.length > 1 && Math.hypot(points[0].x - points.at(-1)!.x, points[0].y - points.at(-1)!.y) < 1e-6)
+    points.pop();
+  return points;
+}
+function nativeAreaPolygon(eda: EasyEdaApi, points: Array<{ x: number; y: number }>) {
+  if (points.length < 3 || !points.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)))
+    throw apiError("invalid_params", "Native area requires finite polygon vertices.");
+  ensureApi("pcb_MathPolygon", "createPolygon", eda);
+  const source = [
+    points[0].x / 0.0254,
+    points[0].y / 0.0254,
+    "L",
+    ...points.slice(1).flatMap((p) => [p.x / 0.0254, p.y / 0.0254]),
+    points[0].x / 0.0254,
+    points[0].y / 0.0254
+  ];
+  const polygon = eda.pcb_MathPolygon.createPolygon(source);
+  if (!polygon) throw apiError("invalid_params", "Native SDK rejected area geometry before write.");
+  return polygon;
+}
+function nativeAreaLayer(layer: string | number, allowAll = false): number {
+  const name = String(layer).toLowerCase();
+  const value =
+    name === "toplayer"
+      ? 1
+      : name === "bottomlayer"
+        ? 2
+        : allowAll && ["all", "alllayers"].includes(name)
+          ? 12
+          : Number(layer);
+  if (![1, 2, ...(allowAll ? [12] : [])].includes(value))
+    throw apiError("unsupported_layer", "Native area supports explicit top/bottom copper layers or MULTI keepout.");
+  return value;
+}
+function nativeKeepoutRules(type = "all"): number[] {
+  if (type === "all") return [2, 5, 6, 7, 8];
+  if (["track", "wire"].includes(type)) return [5];
+  if (type === "copper") return [6, 7, 8];
+  throw apiError(
+    "unsupported_rule",
+    "Native keepout type must be all, track, or copper; a via-only rule is not exposed."
+  );
+}
+function assertAreaGeometry(actual: Array<{ x: number; y: number }>, expected: Array<{ x: number; y: number }>) {
+  if (
+    actual.length !== expected.length ||
+    !expected.every((p) => actual.some((q) => Math.hypot(p.x - q.x, p.y - q.y) < 1e-4))
+  )
+    throw apiError("write_readback_unknown", "Native area polygon readback mismatch; do not replay automatically.");
+}
+
 export function normalizeCopperZone(raw: unknown, includeRaw = false): NormalizedCopperZone | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -175,9 +371,15 @@ export function normalizeCopperZone(raw: unknown, includeRaw = false): Normalize
   const clearance = numeric(getProp(raw, "getState_Clearance", ["clearance", "clearanceWidth", "spacing"]));
   const fillType =
     stringOrUndefined(
-      getProp(raw, ["getState_FillType", "getState_FillStyle"], ["fillType", "fillStyle", "fill", "pourType"])
+      getProp(
+        raw,
+        ["getState_PourFillMethod", "getState_FillType", "getState_FillStyle"],
+        ["fillType", "fillStyle", "fill", "pourType"]
+      )
     ) ?? "solid";
-  const isPoured = Boolean(getProp(raw, "getState_IsPoured", ["isPoured", "poured", "rebuilt"]) ?? true);
+  const pourPriority = numeric(getProp(raw, "getState_PourPriority", ["pourPriority"]));
+  const poured = getProp(raw, "getState_IsPoured", ["isPoured", "poured", "rebuilt"]);
+  const isPoured = typeof poured === "boolean" ? poured : undefined;
   const locked = Boolean(getProp(raw, "getState_PrimitiveLock", ["locked", "primitiveLock"]));
 
   const rawPath = getProp(
@@ -185,7 +387,7 @@ export function normalizeCopperZone(raw: unknown, includeRaw = false): Normalize
     ["getState_Path", "getState_Points", "getState_Contour"],
     ["path", "points", "coordinates", "contour"]
   );
-  const points = parsePoints(rawPath);
+  const points = nativePolygonPoints(raw) ?? parsePoints(rawPath);
   const bounds = computeBounds(points);
 
   return {
@@ -194,6 +396,7 @@ export function normalizeCopperZone(raw: unknown, includeRaw = false): Normalize
     layer,
     clearance,
     fillType,
+    pourPriority,
     isPoured,
     points,
     vertexCount: points.length,
@@ -219,13 +422,19 @@ export function normalizeKeepout(raw: unknown, includeRaw = false): NormalizedKe
     ["getState_Path", "getState_Points", "getState_Contour"],
     ["path", "points", "coordinates", "contour"]
   );
-  const points = parsePoints(rawPath);
+  const points = nativePolygonPoints(raw) ?? parsePoints(rawPath);
+  const ruleTypes = getProp(raw, "getState_RuleType", ["ruleType"]);
   const bounds = computeBounds(points);
 
   return {
     primitiveId,
     layer,
-    keepoutType,
+    keepoutType: Array.isArray(ruleTypes)
+      ? [2, 5, 6, 7, 8].every((v) => ruleTypes.includes(v))
+        ? "all"
+        : "native_rules"
+      : keepoutType,
+    ...(Array.isArray(ruleTypes) ? { ruleTypes } : {}),
     points,
     vertexCount: points.length,
     bounds,
@@ -239,7 +448,9 @@ export async function fetchPcbCopperZones(
   filters: { net?: string; layer?: string | number; primitiveId?: string; limit?: number; includeRaw?: boolean } = {}
 ): Promise<{ total: number; count: number; zones: NormalizedCopperZone[] }> {
   let rawList: unknown[] = [];
-  if (eda.pcb_PrimitiveCopperArea?.getAll) {
+  if (eda.pcb_PrimitivePour?.getAll) {
+    rawList = toArray(await eda.pcb_PrimitivePour.getAll());
+  } else if (eda.pcb_PrimitiveCopperArea?.getAll) {
     rawList = toArray(await eda.pcb_PrimitiveCopperArea.getAll());
   } else if (eda.pcb_PrimitiveRegion?.getAll) {
     // Check if regions include copper zones
@@ -253,6 +464,13 @@ export async function fetchPcbCopperZones(
   let zones = rawList
     .map((item) => normalizeCopperZone(item, filters.includeRaw))
     .filter((z): z is NormalizedCopperZone => z !== null);
+  if (eda.pcb_PrimitivePour) {
+    for (const zone of zones) {
+      zone.fillEvidence = await readNativePourFillEvidence(eda, zone.primitiveId);
+      zone.pouredVerified = zone.fillEvidence.status === "filled";
+      zone.isPoured = zone.fillEvidence.status === "unknown" ? undefined : zone.pouredVerified;
+    }
+  }
 
   const total = zones.length;
 
@@ -287,7 +505,7 @@ export async function fetchPcbKeepouts(
     const regions = toArray(await eda.pcb_PrimitiveRegion.getAll());
     rawList = regions.filter((r: any) => {
       const type = String(getProp(r, "getState_Type", ["type", "regionType"]) ?? "").toLowerCase();
-      return type.includes("keepout") || type.includes("restriction");
+      return Array.isArray(r.getState_RuleType?.()) || type.includes("keepout") || type.includes("restriction");
     });
   }
 
@@ -372,11 +590,19 @@ export async function preparePcbCopperKeepoutMutation(
         );
       }
 
-      const clearance = numeric(params.clearance) ?? 0.254;
+      if (eda.pcb_PrimitivePour && params.clearance !== undefined)
+        throw apiError(
+          "unsupported_clearance",
+          "Native Pour has no per-zone clearance property. Omit clearance and separately verify native DRC rules."
+        );
+      const clearance = numeric(params.clearance) ?? (eda.pcb_PrimitivePour ? undefined : 0.254);
       const fillType = stringOrUndefined(params.fillType) ?? "solid";
+      const pourPriority = validatePriority(params.pourPriority);
+      if (pourPriority !== undefined && !eda.pcb_PrimitivePour)
+        throw apiError("unsupported_api", "Native Pour API is required for pourPriority.");
       const bounds = computeBounds(points);
 
-      const impact = `Creates copper zone on layer ${layer} (Net: ${net}, fill: ${fillType}, clearance: ${clearance}mm, area: ${bounds.width * bounds.height}mm²).`;
+      const impact = `Creates copper zone boundary on layer ${layer} (Net: ${net}, fill: ${fillType}, clearance: ${clearance === undefined ? "native DRC rules; not modified" : `${clearance}mm`}, area: ${bounds.width * bounds.height}mm²). Filling and clearances require separate verification.`;
       const operation: PcbCopperKeepoutOperation = {
         entity: "copperZone",
         action: "create",
@@ -384,7 +610,8 @@ export async function preparePcbCopperKeepoutMutation(
         layer,
         points,
         clearance,
-        fillType
+        fillType,
+        pourPriority
       };
 
       const record = extensionMutations.prepare({
@@ -393,8 +620,23 @@ export async function preparePcbCopperKeepoutMutation(
         target: currentTarget,
         operation,
         before: { exists: false },
-        requestedAfter: { net, layer, points, clearance, fillType, bounds },
-        changedKeys: ["net", "layer", "points", "clearance", "fillType"],
+        requestedAfter: {
+          net,
+          layer,
+          points,
+          clearance,
+          fillType,
+          bounds,
+          ...(pourPriority !== undefined ? { pourPriorityPosition: pourPriority } : {})
+        },
+        changedKeys: [
+          "net",
+          "layer",
+          "points",
+          "clearance",
+          "fillType",
+          ...(pourPriority !== undefined ? ["pourPriority"] : [])
+        ],
         scope: `copperZone:create:layer=${layer}:net=${net}`,
         impact,
         ttlMs: 5 * 60_000
@@ -416,6 +658,9 @@ export async function preparePcbCopperKeepoutMutation(
         throw apiError("missing_parameters", "Copper zone modification requires 'zoneId'.");
       }
       const properties = isRecord(params.properties) ? (params.properties as Record<string, any>) : {};
+      validateModifyProperties("copperZone", properties);
+      if (properties.pourPriority !== undefined && !eda.pcb_PrimitivePour)
+        throw apiError("unsupported_api", "Native Pour API is required for pourPriority.");
       const changedKeys = Object.keys(properties);
       if (changedKeys.length === 0) {
         throw apiError("missing_parameters", "Copper zone modification requires non-empty 'properties' object.");
@@ -441,7 +686,18 @@ export async function preparePcbCopperKeepoutMutation(
         target: currentTarget,
         operation,
         before: currentZone,
-        requestedAfter: { ...currentZone, ...properties },
+        requestedAfter: {
+          ...currentZone,
+          ...properties,
+          ...(properties.pourPriority !== undefined
+            ? {
+                pourPriority: undefined,
+                requestedPriorityPosition: properties.pourPriority,
+                priorityNote:
+                  "Native list insertion request; effective order must be read back and can differ from this argument."
+              }
+            : {})
+        },
         changedKeys,
         scope: `copperZone:modify:${zoneId}`,
         impact,
@@ -603,6 +859,7 @@ export async function preparePcbCopperKeepoutMutation(
         throw apiError("missing_parameters", "Keepout modification requires 'keepoutId'.");
       }
       const properties = isRecord(params.properties) ? (params.properties as Record<string, any>) : {};
+      validateModifyProperties("keepout", properties);
       const changedKeys = Object.keys(properties);
       if (changedKeys.length === 0) {
         throw apiError("missing_parameters", "Keepout modification requires non-empty 'properties' object.");
@@ -697,8 +954,115 @@ export async function executePcbCopperKeepoutMutation(
   before?: unknown
 ): Promise<{ executed: boolean; readback: Record<string, unknown> }> {
   const eda = api();
+  if (op.action === "modify") validateModifyProperties(op.entity, op.properties);
+  if (op.entity === "copperZone" && op.action === "create") validatePriority(op.pourPriority);
 
   if (op.entity === "copperZone") {
+    if (eda.pcb_PrimitivePour && op.action !== "create") {
+      const sdk = eda.pcb_PrimitivePour;
+      if (op.action === "delete") {
+        await sdk.delete([op.zoneId]);
+        if ((await fetchPcbCopperZones(eda, { primitiveId: op.zoneId })).count)
+          throw apiError("write_readback_unknown", "Native pour still exists after delete.");
+        return { executed: true, readback: { action: "deleteCopperZone", primitiveId: op.zoneId, deleted: true } };
+      }
+      if (op.action === "rebuild") {
+        if (!op.zoneId)
+          throw apiError(
+            "unsupported_api",
+            "Native rebuild requires an explicit pour primitive ID; no global rebuild API is assumed."
+          );
+        const pour = await sdk.get(op.zoneId);
+        if (typeof pour?.rebuildCopperRegion !== "function")
+          throw apiError("unsupported_api", "Native pour rebuild is unavailable.");
+        const result = await pour.rebuildCopperRegion();
+        const fillEvidence = await readNativePourFillEvidence(eda, op.zoneId);
+        return {
+          executed: true,
+          readback: {
+            action: "rebuildCopper",
+            zoneId: op.zoneId,
+            rebuildRequested: true,
+            nativeReturn: result ? "poured_object" : "undefined",
+            nativeReturnedPourId: result?.getState_PourPrimitiveId?.(),
+            pouredVerified: fillEvidence.status === "filled",
+            fillEvidence,
+            rebuildFreshnessVerified: false,
+            note: "Rebuild call resolved. Owned fill presence was checked independently; absence/unknown is not success. Rebuild freshness, clearance, connectivity and DRC remain unverified."
+          }
+        };
+      }
+      if (op.properties.clearance !== undefined)
+        throw apiError("unsupported_clearance", "Native Pour.modify has no clearance property.");
+      const properties: Record<string, unknown> = {};
+      if (op.properties.net !== undefined) properties.net = op.properties.net;
+      if (op.properties.layer !== undefined) properties.layer = nativeAreaLayer(op.properties.layer);
+      if (op.properties.points) properties.complexPolygon = nativeAreaPolygon(eda, op.properties.points);
+      if (op.properties.fillType !== undefined) properties.pourFillMethod = op.properties.fillType;
+      if (op.properties.pourPriority !== undefined) properties.pourPriority = op.properties.pourPriority;
+      await sdk.modify(op.zoneId, properties);
+      const inventory = await fetchPcbCopperZones(eda, { limit: 500 });
+      const zone = inventory.zones.find((z) => z.primitiveId === op.zoneId);
+      if (!zone) throw apiError("write_readback_unknown", "Modified native pour could not be read back.");
+      if (op.properties.points) assertAreaGeometry(zone.points, op.properties.points);
+      if (
+        (op.properties.net !== undefined && zone.net !== op.properties.net) ||
+        (op.properties.layer !== undefined && zone.layer !== nativeAreaLayer(op.properties.layer)) ||
+        (op.properties.fillType !== undefined && zone.fillType !== op.properties.fillType)
+      )
+        throw apiError("write_readback_unknown", "Native pour property readback mismatch.");
+      return {
+        executed: true,
+        readback: {
+          action: "modifyCopperZone",
+          primitiveId: op.zoneId,
+          zone,
+          pouredVerified: false,
+          ...priorityReadback(op.properties.pourPriority, zone, inventory.zones)
+        }
+      };
+    }
+    if (eda.pcb_PrimitivePour?.create && op.action === "create") {
+      if (op.clearance !== undefined)
+        throw apiError(
+          "unsupported_clearance",
+          "Native Pour.create has no per-zone clearance argument. Configure and verify native DRC clearance separately; omit clearance here."
+        );
+      const layer = nativeAreaLayer(op.layer);
+      const polygon = nativeAreaPolygon(eda, op.points);
+      const fill = op.fillType ?? "solid";
+      if (!["solid", "grid"].includes(fill))
+        throw apiError("unsupported_fill", "Native pour fill must be solid or grid.");
+      const created = await eda.pcb_PrimitivePour.create(
+        op.net,
+        layer,
+        polygon,
+        fill,
+        false,
+        "MCP copper",
+        op.pourPriority ?? 0,
+        1,
+        false
+      );
+      const id = created?.getState_PrimitiveId?.();
+      if (!id) throw apiError("write_readback_unknown", "Native pour ID missing; do not retry.");
+      const { zones } = await fetchPcbCopperZones(eda, { layer, limit: 500 });
+      const zone = zones.find((z) => z.primitiveId === id);
+      if (!zone) throw apiError("write_readback_unknown", "Created native pour was not independently read back.");
+      assertAreaGeometry(zone.points, op.points);
+      if (zone.net !== op.net) throw apiError("write_readback_unknown", "Native pour net readback mismatch.");
+      return {
+        executed: true,
+        readback: {
+          action: "createCopperZone",
+          primitiveId: id,
+          zone,
+          pouredVerified: false,
+          ...priorityReadback(op.pourPriority, zone, zones),
+          clearanceSource: "native_drc_rules_not_set_by_this_operation"
+        }
+      };
+    }
     if (op.action === "create") {
       let createdId: string | undefined;
 
@@ -835,6 +1199,41 @@ export async function executePcbCopperKeepoutMutation(
   }
 
   if (op.entity === "keepout") {
+    if (!eda.pcb_PrimitiveKeepout && eda.pcb_PrimitiveRegion && op.action === "modify") {
+      const properties: Record<string, unknown> = {};
+      if (op.properties.layer !== undefined) properties.layer = nativeAreaLayer(op.properties.layer, true);
+      if (op.properties.points) properties.complexPolygon = nativeAreaPolygon(eda, op.properties.points);
+      if (op.properties.keepoutType !== undefined) properties.ruleType = nativeKeepoutRules(op.properties.keepoutType);
+      await eda.pcb_PrimitiveRegion.modify(op.keepoutId, properties);
+      const keepout = (await fetchPcbKeepouts(eda, { primitiveId: op.keepoutId })).keepouts[0];
+      if (!keepout) throw apiError("write_readback_unknown", "Modified native keepout not found.");
+      if (op.properties.points) assertAreaGeometry(keepout.points, op.properties.points);
+      if (
+        (op.properties.layer !== undefined && keepout.layer !== nativeAreaLayer(op.properties.layer, true)) ||
+        (op.properties.keepoutType !== undefined &&
+          JSON.stringify([...(keepout.ruleTypes ?? [])].sort()) !==
+            JSON.stringify(nativeKeepoutRules(op.properties.keepoutType).sort()))
+      )
+        throw apiError("write_readback_unknown", "Native keepout restriction/layer readback mismatch.");
+      return { executed: true, readback: { action: "modifyKeepout", primitiveId: op.keepoutId, keepout } };
+    }
+    if (!eda.pcb_PrimitiveKeepout && eda.pcb_PrimitiveRegion?.create && op.action === "create") {
+      const layer = nativeAreaLayer(op.layer, true),
+        rules = nativeKeepoutRules(op.keepoutType);
+      const polygon = nativeAreaPolygon(eda, op.points);
+      const created = await eda.pcb_PrimitiveRegion.create(layer, polygon, rules, "MCP keepout", 1, false);
+      const id = created?.getState_PrimitiveId?.();
+      if (!id) throw apiError("write_readback_unknown", "Native keepout ID missing; do not retry.");
+      const { keepouts } = await fetchPcbKeepouts(eda, { primitiveId: id, layer });
+      const keepout = keepouts.find((k) => k.primitiveId === id);
+      if (!keepout || JSON.stringify([...(keepout.ruleTypes ?? [])].sort()) !== JSON.stringify([...rules].sort()))
+        throw apiError(
+          "write_readback_unknown",
+          "Native keepout restrictions were not independently verified; do not retry."
+        );
+      assertAreaGeometry(keepout.points, op.points);
+      return { executed: true, readback: { action: "createKeepout", primitiveId: id, keepout } };
+    }
     if (op.action === "create") {
       let createdId: string | undefined;
 
