@@ -427,7 +427,7 @@ export async function preparePcbTrackViaMutation(
         throw apiError("not_found", `Track with primitiveId '${trackId}' not found on active PCB.`);
       }
 
-      const impact = `Destructively deletes PCB track ${trackId} (Net: ${currentTrack.net ?? "none"}, Layer: ${currentTrack.layer}, length: ${currentTrack.length}mil).`;
+      const impact = `Destructively deletes PCB track ${trackId} (Net: ${currentTrack.net ?? "none"}, Layer: ${currentTrack.layer}, length: ${currentTrack.length}mil). Native inventory absence alone cannot verify serialized/Gerber copper removal; execution remains unknown pending independent proof. Do not replay automatically.`;
       const operation: PcbTrackViaOperation = {
         entity: "track",
         action: "delete",
@@ -948,29 +948,53 @@ export async function executePcbTrackViaMutation(
     }
 
     if (op.action === "delete") {
-      if (eda.pcb_PrimitiveTrack?.delete) {
-        await eda.pcb_PrimitiveTrack.delete([op.trackId]);
-      } else if (eda.pcb_PrimitiveLine?.delete) {
-        await eda.pcb_PrimitiveLine.delete([op.trackId]);
-      } else {
-        ensureApi("pcb_PrimitiveTrack", "delete", eda);
-      }
-
-      // Readback verification: verify it is gone
-      const { tracks } = await fetchPcbTracks(eda, { primitiveId: op.trackId, limit: 1 });
-      if (tracks.length > 0) {
-        throw apiError("readback_failed", `PCB track '${op.trackId}' still exists after delete operation.`);
-      }
-
-      return {
-        executed: true,
-        readback: {
-          units: "mil",
-          action: "deleteTrack",
-          primitiveId: op.trackId,
-          deleted: true
-        }
+      const native = eda.pcb_PrimitiveTrack?.delete ? eda.pcb_PrimitiveTrack : eda.pcb_PrimitiveLine;
+      if (!native?.delete) ensureApi("pcb_PrimitiveLine", "delete", eda);
+      if (!eda.pcb_PrimitiveTrack?.getAll && !eda.pcb_PrimitiveLine?.getAll)
+        ensureApi("pcb_PrimitiveLine", "getAll", eda);
+      const evidence: Record<string, unknown> = {
+        units: "mil",
+        action: "deleteTrack",
+        primitiveId: op.trackId,
+        nativeRequestSucceeded: null,
+        inventoryIdAbsent: null,
+        physicalCopperRemovalVerified: false,
+        sdkPending: true,
+        automaticReplay: false,
+        readbackLimitations: [
+          "SDK acknowledgement and runtime Line/Track inventory do not verify serialized source-child removal.",
+          "A merged runtime parent may disappear while its source-child copper remains in saved exports or Gerber.",
+          "Independent scoped serialized/manufacturing proof is not available in this executor."
+        ]
       };
+      const mutationId = (op as PcbTrackViaOperation & { mutationId?: string }).mutationId;
+      const publish = () => {
+        if (mutationId) extensionMutations.recordExecutionEvidence(mutationId, evidence);
+      };
+      publish();
+      try {
+        const response = await native.delete([op.trackId]);
+        // Legacy SDK Line.delete resolves true even when it discards the native
+        // deleted-ID payload. This field acknowledges only that SDK request.
+        evidence.nativeRequestSucceeded = response !== false;
+      } catch (error) {
+        evidence.nativeRequestSucceeded = false;
+        evidence.nativeRequestError = String(error);
+      }
+      evidence.sdkPending = false;
+      publish();
+      try {
+        const { tracks } = await fetchPcbTracks(eda, { primitiveId: op.trackId, limit: 1 });
+        evidence.inventoryIdAbsent = tracks.length === 0;
+      } catch (error) {
+        evidence.inventoryReadbackError = String(error);
+      }
+      publish();
+      throw apiError(
+        "write_readback_unknown",
+        `Track delete request settled; physical copper removal is unverified. Inspect scoped saved-source/Gerber proof before any further write; do not replay. ${JSON.stringify(evidence)}`,
+        evidence
+      );
     }
   }
 

@@ -212,6 +212,7 @@ describe("pcbTrackViaMutations", () => {
       expect(result.mutationId).toBeDefined();
       expect(result.confirmation).toBe(`CONFIRM pcb:deleteTrack ${result.mutationId}`);
       expect(result.preview.impact).toContain("Destructively deletes PCB track trk-1");
+      expect(result.preview.impact).toContain("execution remains unknown pending independent proof");
     });
 
     it("prepares via creation mutation", async () => {
@@ -382,18 +383,20 @@ describe("pcbTrackViaMutations", () => {
       expect((res.readback.track as any).lineWidth).toBe(0.5);
     });
 
-    it("executes track delete and verifies removal on readback", async () => {
+    it("reports only inventory absence without claiming physical track removal", async () => {
       // api returning only mockTrack2 (mockTrack1 deleted)
       const api = createMockApi([mockTrack2]);
 
-      const res = await executePcbTrackViaMutation(() => api, {
-        entity: "track",
-        action: "delete",
-        trackId: "trk-1"
+      await expect(
+        executePcbTrackViaMutation(() => api, {
+          entity: "track",
+          action: "delete",
+          trackId: "trk-1"
+        })
+      ).rejects.toMatchObject({
+        code: "write_readback_unknown",
+        details: { inventoryIdAbsent: true, physicalCopperRemovalVerified: false }
       });
-
-      expect(res.executed).toBe(true);
-      expect(res.readback.deleted).toBe(true);
     });
 
     it("executes via create, modify and delete with readback", async () => {
@@ -716,5 +719,107 @@ it.each(["unchanged-width", "wrong-net", "adjacent"])(
     } finally {
       vi.useRealTimers();
     }
+  }
+);
+
+it("keeps merged-parent deletion unknown when runtime absence cannot prove source-child copper removal", async () => {
+  const doc = { uuid: "pcb-delete-proof", parentProjectUuid: "project", documentType: 3 };
+  // An SDK runtime parent can represent two persisted source segments. Removing
+  // the parent from its inventory need not remove either serialized child.
+  const sourceChildren = [
+    { primitiveId: "source-a", net: "SUPPLY", layer: 1, startX: 0, startY: 0, endX: 40, endY: 0, lineWidth: 10 },
+    { primitiveId: "source-b", net: "SUPPLY", layer: 1, startX: 40, startY: 0, endX: 100, endY: 0, lineWidth: 10 }
+  ];
+  let runtime = [{ ...sourceChildren[0], primitiveId: "merged-runtime-parent", endX: 100 }];
+  const nativeDelete = vi.fn(async (ids: string[]) => {
+    runtime = runtime.filter((line) => !ids.includes(line.primitiveId));
+    return true;
+  });
+  const api = () => ({
+    dmt_SelectControl: { getCurrentDocumentInfo: async () => doc },
+    pcb_PrimitiveLine: { getAll: async () => runtime, delete: nativeDelete }
+  });
+  const prepared: any = await preparePcbTrackViaMutation(api, {
+    entity: "track",
+    action: "delete",
+    trackId: "merged-runtime-parent"
+  });
+  const handlers = createActionHandlers(api, new DrcRules(api));
+  const request = {
+    action: "mutation",
+    confirmation: prepared.confirmation,
+    params: { mutationId: prepared.mutationId }
+  };
+  const record: any = await handlers.confirmedAction(request);
+  expect(runtime).toEqual([]);
+  expect(sourceChildren).toHaveLength(2);
+  expect(record.status).toBe("unknown");
+  expect(record.executionEvidence).toMatchObject({
+    nativeRequestSucceeded: true,
+    inventoryIdAbsent: true,
+    physicalCopperRemovalVerified: false,
+    sdkPending: false,
+    automaticReplay: false
+  });
+  expect(record.executionEvidence.readbackLimitations).toEqual(expect.any(Array));
+  expect(record.executionEvidence.readbackLimitations.join(" ")).toMatch(/serialized|Gerber/);
+  expect(record.after?.deleted).not.toBe(true);
+  await expect(handlers.confirmedAction(request)).rejects.toMatchObject({ code: "mutation_invalid_state" });
+  expect(nativeDelete).toHaveBeenCalledTimes(1);
+});
+
+it.each(["rejected", "false", "readback-error", "still-present"])(
+  "retains honest delete evidence after a %s native/readback outcome",
+  async (mode) => {
+    const line = {
+      primitiveId: "selected-line",
+      layer: 1,
+      net: "SUPPLY",
+      startX: 0,
+      startY: 0,
+      endX: 10,
+      endY: 0,
+      lineWidth: 6
+    };
+    let dispatched = false;
+    const api = () => ({
+      dmt_SelectControl: {
+        getCurrentDocumentInfo: async () => ({
+          uuid: "pcb-delete-errors",
+          parentProjectUuid: "project",
+          documentType: 3
+        })
+      },
+      pcb_PrimitiveLine: {
+        getAll: async () => {
+          if (dispatched && mode === "readback-error") throw new Error("inventory unavailable");
+          return dispatched && mode !== "still-present" ? [] : [line];
+        },
+        delete: async () => {
+          dispatched = true;
+          if (mode === "rejected") throw new Error("native reply lost");
+          return mode !== "false";
+        }
+      }
+    });
+    const prepared: any = await preparePcbTrackViaMutation(api, {
+      entity: "track",
+      action: "delete",
+      trackId: line.primitiveId
+    });
+    const handlers = createActionHandlers(api, new DrcRules(api));
+    const record: any = await handlers.confirmedAction({
+      action: "mutation",
+      confirmation: prepared.confirmation,
+      params: { mutationId: prepared.mutationId }
+    });
+    expect(record.status).toBe("unknown");
+    expect(record.executionEvidence).toMatchObject({
+      nativeRequestSucceeded: mode !== "rejected" && mode !== "false",
+      inventoryIdAbsent: mode === "readback-error" ? null : mode !== "still-present",
+      physicalCopperRemovalVerified: false,
+      sdkPending: false
+    });
+    expect(record.after?.deleted).not.toBe(true);
   }
 );

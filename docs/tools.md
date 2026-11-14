@@ -800,6 +800,8 @@ Stages creating, modifying, or destructively deleting copper tracks and vias on 
 
 Returns `mutationId`, exact confirmation token `CONFIRM pcb:<track|via>:<create|modify|delete> <mutationId>`, and structured `preview`. Previews expire after 5 minutes and require execution via `easyeda_confirmed_action` with `action="mutation"`.
 
+**Track-delete verification boundary:** after dispatch, this executor returns an `unknown` mutation with `executionEvidence.nativeRequestSucceeded`, `inventoryIdAbsent`, `physicalCopperRemovalVerified:false`, `sdkPending`, and `readbackLimitations`. It does not return `deleted:true` or promote the mutation to `applied` merely because its runtime ID disappeared. A native merge can replace two persisted source lines with a runtime parent whose deletion leaves source-child copper in saved exports and Gerber. `nativeRequestSucceeded` acknowledges only a resolved SDK request without a false result, not physical removal. A rejected request, false response, still-present ID, or failed inventory observation also remains unknown; evidence distinguishes these cases. Missing observations remain `null`, never inferred absent. Inspect independent scoped saved-source/manufacturing proof before further writes; do not automatically replay. No serialized/Gerber verifier or automatic reconciliation is introduced here. This conservative status change applies to single-track deletion; track create/modify and via operations retain their existing contracts.
+
 **Parameters:**
 - **`entity`** (`"track" | "via"`, **required**): Entity type to mutate.
 - **`action`** (`"create" | "modify" | "delete"`, **required**): Operation to stage.

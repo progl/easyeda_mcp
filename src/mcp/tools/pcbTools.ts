@@ -530,7 +530,7 @@ export function registerPcbTools(server: McpServer, bridge: EditorClient): void 
     {
       title: "Prepare PCB track or via mutation",
       description:
-        "Prepares creating, modifying, or destructively deleting copper tracks and vias on the active PCB canvas with safety preview and exact confirmation phrase. Does not modify the PCB until confirmed.",
+        "Prepares creating, modifying, or destructively deleting copper tracks and vias on the active PCB canvas with safety preview and exact confirmation phrase. Does not modify the PCB until confirmed. Track deletion records nativeRequestSucceeded/inventoryIdAbsent but remains unknown with physicalCopperRemovalVerified:false: runtime ID absence does not prove serialized or Gerber copper removal. Inspect independent scoped export proof; never replay automatically.",
       inputSchema: {
         units: z
           .enum(["mil", "mm"])
